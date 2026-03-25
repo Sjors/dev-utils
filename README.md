@@ -42,3 +42,14 @@ BUILD_DIR=build-tidy-debug ~/utils/tidy-btc-mac.zsh
 ~/utils/tidy-btc-mac.zsh --all
 ~/utils/tidy-btc-mac.zsh ipc/libmultiprocess/src/mp/util.cpp
 ```
+
+## `guix-try`
+
+Fetch a macOS guix build from a remote SSH host, extract it, ad hoc codesign it, and open it in Finder. Auto-detects arm64 vs x86_64. Run from a Bitcoin Core checkout.
+
+```sh
+cd ~/bitcoin
+~/utils/guix-try            # Bitcoin-Qt.app (default)
+~/utils/guix-try --bitcoind # CLI binaries
+~/utils/guix-try --help     # all options and environment variables
+```

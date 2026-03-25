@@ -1,0 +1,97 @@
+#!/bin/bash
+set -euo pipefail
+
+REMOTE="${REMOTE:-guix}"
+REMOTE_REPO="${REMOTE_REPO:-bitcoin}"
+if [[ "$(uname -m)" == "arm64" ]]; then
+    HOST="${HOST:-arm64-apple-darwin}"
+else
+    HOST="${HOST:-x86_64-apple-darwin}"
+fi
+MODE="desktop"
+
+usage() {
+    cat >&2 <<EOF
+Usage: $(basename "$0") [--signed] [--bitcoind | --desktop]
+
+Fetch a macOS guix build from $REMOTE, extract, ad hoc codesign, and open in Finder.
+Auto-detects arm64 vs x86_64 from the current machine.
+
+Options:
+  --signed    Fetch the codesigned build (typically a release tag)
+  --bitcoind  Fetch the .tar.gz with CLI binaries (bitcoind, bitcoin-cli, etc.)
+  --desktop   Fetch the .zip with Bitcoin-Qt.app (default)
+
+Environment:
+  REMOTE       SSH host (default: guix)
+  REMOTE_REPO  Repo path on remote (default: bitcoin)
+  HOST         Target triple override (e.g. x86_64-apple-darwin for Rosetta testing)
+EOF
+    exit 1
+}
+
+SIGNED=0
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --signed)   SIGNED=1; shift ;;
+        --bitcoind) MODE="bitcoind"; shift ;;
+        --desktop)  MODE="desktop"; shift ;;
+        -h|--help)  usage ;;
+        *)          echo "Unknown option: $1" >&2; usage ;;
+    esac
+done
+
+# Use tag version if on a tag, otherwise short commit hash
+if TAG=$(git describe --exact-match HEAD 2>/dev/null); then
+    V="${TAG#v}"
+else
+    V=$(git rev-parse --short=12 HEAD)
+fi
+
+DISTNAME="bitcoin-${V}"
+if [[ "$SIGNED" -eq 1 ]]; then
+    REMOTE_DIR="${REMOTE}:${REMOTE_REPO}/guix-build-${V}/output/${HOST}-codesigned"
+else
+    REMOTE_DIR="${REMOTE}:${REMOTE_REPO}/guix-build-${V}/output/${HOST}"
+fi
+TMPDIR="/tmp/guix-try-${V}"
+mkdir -p "$TMPDIR"
+
+case "${MODE}" in
+    desktop)
+        if [[ "$SIGNED" -eq 1 ]]; then
+            ARCHIVE="${DISTNAME}-${HOST}.zip"
+        else
+            ARCHIVE="${DISTNAME}-${HOST}-unsigned.zip"
+        fi
+        echo "Fetching ${ARCHIVE}..."
+        scp "${REMOTE_DIR}/${ARCHIVE}" "$TMPDIR/"
+        echo "Extracting..."
+        unzip -o "$TMPDIR/$ARCHIVE" -d "$TMPDIR/app"
+        if [[ "$SIGNED" -eq 0 ]]; then
+            echo "Ad hoc codesigning Bitcoin-Qt.app..."
+            codesign -s - -f --deep "$TMPDIR/app/Bitcoin-Qt.app"
+        fi
+        echo "Opening in Finder..."
+        open "$TMPDIR/app"
+        ;;
+    bitcoind)
+        if [[ "$SIGNED" -eq 1 ]]; then
+            ARCHIVE="${DISTNAME}-${HOST}.tar.gz"
+        else
+            ARCHIVE="${DISTNAME}-${HOST}-unsigned.tar.gz"
+        fi
+        echo "Fetching ${ARCHIVE}..."
+        scp "${REMOTE_DIR}/${ARCHIVE}" "$TMPDIR/"
+        echo "Extracting..."
+        tar xzf "$TMPDIR/$ARCHIVE" -C "$TMPDIR"
+        if [[ "$SIGNED" -eq 0 ]]; then
+            echo "Ad hoc codesigning binaries..."
+            codesign -s - -f "$TMPDIR/${DISTNAME}/bin/"* "$TMPDIR/${DISTNAME}/libexec/"*
+        fi
+        echo "Opening in Finder..."
+        open "$TMPDIR/${DISTNAME}/bin"
+        ;;
+esac
+
+echo "Done. Files in $TMPDIR"
