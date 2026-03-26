@@ -43,6 +43,27 @@ BUILD_DIR=build-tidy-debug ~/utils/tidy-btc-mac.zsh
 ~/utils/tidy-btc-mac.zsh ipc/libmultiprocess/src/mp/util.cpp
 ```
 
+## `git-range-diff-remote`
+
+Range-diff local commits against the remote version of a PR.
+
+Default mode compares local HEAD against the pushed remote ref (`@{push}`), useful for reviewing your own changes before pushing. `--since-ack` mode finds your last ACK/utACK comment on the PR and range-diffs from that commit, useful when re-reviewing a PR after a force-push. Handles detached HEAD automatically.
+
+Install by symlinking the script and man page:
+
+```sh
+mkdir -p ~/bin          # ensure this is on $PATH
+mkdir -p ~/share/man/man1
+ln -s ~/utils/git-range-diff-remote                  ~/bin/git-range-diff-remote
+ln -s ~/utils/share/man/man1/git-range-diff-remote.1  ~/share/man/man1/git-range-diff-remote.1
+```
+
+```sh
+git range-diff-remote                   # local vs pushed
+git range-diff-remote --since-ack       # local vs last ACK'd commit
+git range-diff-remote --help            # full usage (man page)
+```
+
 ## `guix-try`
 
 Fetch a macOS guix build from a remote SSH host, extract it, ad hoc codesign it, and open it in Finder. Auto-detects arm64 vs x86_64. Run from a Bitcoin Core checkout.

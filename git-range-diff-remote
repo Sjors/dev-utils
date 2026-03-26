@@ -1,0 +1,271 @@
+#!/usr/bin/env bash
+# To regenerate the man page after editing the usage() text:
+#   help2man git-range-diff-remote --no-info \
+#     --name "range-diff local commits against a PR's remote state" \
+#     -o share/man/man1/git-range-diff-remote.1
+set -euo pipefail
+
+die() {
+    printf '%s\n' "$*" >&2
+    exit 1
+}
+
+usage() {
+    cat <<'EOF'
+Usage: git range-diff-remote [OPTION]... [RANGE-DIFF-OPTION]...
+
+Compare local commits against the remote version of the current pull request
+using git-range-diff(1).
+
+In the default mode the "old" side is the pushed remote ref (@{push}) and the
+"new" side is local HEAD. Useful for reviewing local changes before pushing.
+
+With --since-ack the "old" side is the commit you last ACK'd (or utACK'd) in a
+PR comment, falling back to your previous review push if no ACK is found.
+Useful when re-reviewing a PR after a force-push.
+
+Options:
+      --since-ack   range-diff from last ACK'd commit instead of @{push}
+  -h, --help        display this help and exit
+      --version     output version information and exit
+
+Any unrecognised options (e.g. --creation-factor, --no-color) are forwarded
+to git-range-diff(1).
+
+Requirements: git, gh, jq
+EOF
+}
+
+ensure_branch_context() {
+    local current_branch
+    current_branch="$(git symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+    [[ -n "$current_branch" ]] && return 0
+
+    local -a remote_refs
+    mapfile -t remote_refs < <(
+        git for-each-ref --format='%(refname:short)' --points-at HEAD refs/remotes \
+        | grep -v '/HEAD$' || true
+    )
+
+    if (( ${#remote_refs[@]} == 0 )); then
+        die "Detached HEAD; check out a branch and rerun"
+    elif (( ${#remote_refs[@]} > 1 )); then
+        local msg="Detached HEAD; did you mean to check out one of these?"$'\n'
+        local ref
+        for ref in "${remote_refs[@]}"; do
+            msg+="  git checkout ${ref#*/}"$'\n'
+        done
+        die "${msg%$'\n'}"
+    fi
+
+    local remote_ref="${remote_refs[0]}"
+    local suggested="${remote_ref#*/}"
+    die "Detached HEAD; did you mean:"$'\n'"  git checkout $suggested"
+}
+
+# Find the PR number for a given remote owner and branch name.
+# Sets the global variable: pr_number
+resolve_pr() {
+    local owner="$1" branch="$2"
+
+    login="$(gh api user --jq .login)" || die "Failed to determine GitHub login via gh"
+
+    if [[ "${owner,,}" != "${login,,}" ]]; then
+        pr_number="$(gh pr list --head "${branch}" --json number --jq '.[0].number // empty')" \
+            || die "Failed to look up PR for ${owner}:${branch}"
+    else
+        pr_number="$(gh pr list --state open --search "head:$branch" \
+            --json number,headRefName,headRepositoryOwner \
+            --jq ".[] | select((.headRefName | ascii_downcase) == (\"$branch\" | ascii_downcase) and (.headRepositoryOwner.login | ascii_downcase) == (\"$owner\" | ascii_downcase)) | .number" \
+            | head -n1)" || die "Failed to resolve PR via gh"
+    fi
+
+    [[ -n "$pr_number" ]] || die "No open PR found for $owner:$branch"
+}
+
+# Extract GitHub owner from a remote URL.
+owner_from_url() {
+    local url="$1"
+    printf '%s\n' "$url" | sed -E 's#^[^:]+://[^/]+/##; s#^[^@]+@[^:]+:##; s#^([^/]+)/.*#\1#'
+}
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+
+since_ack=false
+range_diff_args=()
+
+while (( $# > 0 )); do
+    case "$1" in
+        -h|--help) usage; exit 0 ;;
+        --version) printf 'git-range-diff-remote\n'; exit 0 ;;
+        --since-ack) since_ack=true; shift ;;
+        --) shift; range_diff_args+=("$@"); break ;;
+        *) range_diff_args+=("$1"); shift ;;
+    esac
+done
+
+command -v git >/dev/null || die "git is required"
+command -v gh  >/dev/null || die "gh is required"
+command -v jq  >/dev/null || die "jq is required"
+
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "Not inside a git repository"
+ensure_branch_context
+
+# ---------------------------------------------------------------------------
+
+if "$since_ack"; then
+    # -------------------------------------------------------------------
+    # --since-ack mode: range-diff from last ACK'd commit
+    # -------------------------------------------------------------------
+
+    tracking_ref="$(git rev-parse --abbrev-ref --symbolic-full-name @{upstream} 2>/dev/null || true)"
+    [[ -n "$tracking_ref" ]] || die "No upstream ref configured for current branch"
+
+    tracking_remote="${tracking_ref%%/*}"
+    tracking_branch="${tracking_ref#*/}"
+
+    url="$(git remote get-url "$tracking_remote" 2>/dev/null)" || die "Failed to get URL for remote $tracking_remote"
+    owner="$(owner_from_url "$url")" || die "Failed to parse owner from remote URL"
+
+    resolve_pr "$owner" "$tracking_branch"
+
+    pr_json="$(gh pr view "$pr_number" --json comments,reviews,commits,headRefOid,headRefName,headRepositoryOwner)" \
+        || die "Failed to read PR metadata"
+
+    # Verify local HEAD matches PR head
+    pr_head="$(printf '%s\n' "$pr_json" | jq -r '.headRefOid // empty')"
+    pr_head_ref="$(printf '%s\n' "$pr_json" | jq -r '.headRefName // empty')"
+    pr_head_owner="$(printf '%s\n' "$pr_json" | jq -r '.headRepositoryOwner.login // empty')"
+    local_head="$(git rev-parse --verify HEAD^{commit})"
+
+    if [[ -n "$pr_head" && "$local_head" != "$pr_head" ]]; then
+        stale_hint="git fetch --no-tags $tracking_remote $tracking_branch && git merge --ff-only $tracking_ref"
+        die "Local HEAD $local_head does not match PR head $pr_head. Update first (e.g. $stale_hint)."
+    fi
+
+    # Find last ACK/utACK hash from PR comments and reviews
+    prev="$(
+        printf '%s\n' "$pr_json" | jq -r --arg login "$login" '
+            def normalize_time:
+                (.submittedAt // .updatedAt // .createdAt // "");
+
+            def entry:
+                {
+                    at: normalize_time,
+                    body: (.body // ""),
+                    author: (.author.login // "")
+                };
+
+            [
+                (.comments[]? | entry),
+                (.reviews[]?  | entry)
+            ]
+            | map(select(.author == $login))
+            | map(
+                . + {
+                    ack_sha: (try (.body | capture("(?i)(?:^|[^[:alnum:]_])(?:ut)?ack\\b[^0-9a-fA-F]*?(?<sha>[0-9a-fA-F]{7,40})\\b").sha) catch null)
+                }
+            )
+            | map(select(.ack_sha != null))
+            | sort_by(.at)
+            | last
+            | .ack_sha // empty
+        '
+    )" || die "Failed to parse ACK hash from PR metadata"
+
+    prev_source="ack"
+    if [[ -z "$prev" ]]; then
+        prev="$(
+            printf '%s\n' "$pr_json" | jq -r --arg login "$login" '
+                [
+                    .reviews[]?
+                    | {
+                        at: (.submittedAt // .updatedAt // .createdAt // ""),
+                        author: (.author.login // ""),
+                        review_sha: (.commit.oid // "")
+                    }
+                    | select(.author == $login and (.review_sha | length) > 0)
+                ]
+                | sort_by(.at) as $reviews
+                | (($reviews[-1].review_sha) // empty) as $latest_review_sha
+                | if ($latest_review_sha | length) == 0 then
+                    empty
+                  else
+                    (
+                        $reviews
+                        | reverse
+                        | .[1:]
+                        | map(.review_sha)
+                        | map(select(. != $latest_review_sha))
+                        | first
+                    ) // empty
+                  end
+            '
+        )" || die "Failed to parse fallback hash from review history"
+
+        [[ -z "$prev" ]] || prev_source="previous review push"
+    fi
+
+    [[ -n "$prev" ]] || die "No ACK/utACK hash found, and no earlier reviewed commit found to use as fallback"
+
+    n="$(printf '%s\n' "$pr_json" | jq -r '.commits | length')"
+    [[ "$n" =~ ^[0-9]+$ ]] || die "Invalid PR commit count: $n"
+    (( n > 0 )) || die "PR commit count is zero"
+
+    # Fetch the ACK'd commit if not available locally
+    if ! git rev-parse --verify --quiet "$prev^{commit}" >/dev/null; then
+        git fetch --no-tags "$tracking_remote" "$prev" >/dev/null 2>&1 || true
+    fi
+    git rev-parse --verify --quiet "$prev^{commit}" >/dev/null || die "ACK commit $prev is not available locally"
+
+    mb="$(git merge-base --all HEAD "$prev")" || die "Failed to compute merge-base"
+    [[ -n "$mb" ]] || die "No merge-base found between HEAD and $prev"
+
+    printf 'Using PREV=%s N=%s (%s)\n' "$prev" "$n" "$prev_source" >&2
+    git range-diff "$mb...$prev" "$mb...HEAD" "${range_diff_args[@]}"
+
+else
+    # -------------------------------------------------------------------
+    # Default mode: range-diff local HEAD vs pushed remote ref
+    # -------------------------------------------------------------------
+
+    if ! prev="$(git rev-parse --verify @{push} 2>/dev/null)"; then
+        upstream="$(git rev-parse --abbrev-ref --symbolic-full-name @{upstream} 2>/dev/null || true)"
+        upstream_remote="${upstream%%/*}"
+        login="$(gh api user --jq .login 2>/dev/null || true)"
+        if [[ -n "$upstream_remote" && -n "$login" && "$upstream_remote" != "$login" ]]; then
+            die "No push ref configured for current branch (@{push}). This looks like someone else's PR — did you mean:"$'\n'"  git range-diff-remote --since-ack"
+        fi
+        die "No push ref configured for current branch (@{push})"
+    fi
+
+    push_ref="$(git rev-parse --symbolic-full-name @{push})"
+    push_remote="${push_ref#refs/remotes/}"
+    push_remote="${push_remote%%/*}"
+    push_branch="${push_ref#refs/remotes/$push_remote/}"
+
+    if [[ "$prev" == "$(git rev-parse HEAD)" ]]; then
+        current_branch="$(git rev-parse --abbrev-ref HEAD)"
+        push_short="$(git rev-parse --abbrev-ref @{push})"
+        printf 'On branch %s\n' "$current_branch"
+        printf "Your branch is up to date with '%s'.\n" "$push_short"
+        exit 0
+    fi
+
+    url="$(git remote get-url --push "$push_remote" 2>/dev/null || git remote get-url "$push_remote")" \
+        || die "Failed to get URL for remote $push_remote"
+    owner="$(owner_from_url "$url")" || die "Failed to parse owner from remote URL"
+
+    resolve_pr "$owner" "$push_branch"
+
+    pr_view="$(gh pr view "$pr_number" --json commits,baseRefName)" \
+        || die "Failed to read PR metadata"
+
+    n_remote="$(printf '%s\n' "$pr_view" | jq -r '.commits | length')"
+    base_branch="$(printf '%s\n' "$pr_view" | jq -r '.baseRefName')"
+    n_local="$(git rev-list --count "origin/${base_branch}..HEAD")"
+
+    git range-diff "${prev}~${n_remote}..${prev}" "HEAD~${n_local}..HEAD" --creation-factor=95 "${range_diff_args[@]}"
+fi
