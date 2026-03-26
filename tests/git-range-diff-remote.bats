@@ -90,6 +90,51 @@ make_pr_head() {
     [[ "$output" == *"No ACK comment found"* ]]
 }
 
+@test "--since: runs range-diff from specified commit" {
+    echo "old pr work" > pr.txt && git add pr.txt
+    git commit -q -m "old PR version"
+    export SINCE_SHA
+    SINCE_SHA="$(git rev-parse HEAD)"
+
+    git reset -q --hard "$BASE_SHA"
+    echo "new pr work" > pr.txt && git add pr.txt
+    git commit -q -m "new PR version"
+
+    git remote add w0xlt "https://github.com/w0xlt/bitcoin.git"
+    git update-ref "refs/remotes/w0xlt/ipc-submit-block" HEAD
+    git checkout -q --detach HEAD
+
+    run "$SCRIPT" --since "$SINCE_SHA" 2>&1
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Using PREV=$SINCE_SHA N=1"* ]]
+}
+
+@test "--since: dies with clear message when commit is ancestor of HEAD" {
+    make_pr_head
+
+    run "$SCRIPT" --since "$BASE_SHA" 2>&1
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"ancestor of HEAD"* ]]
+}
+
+@test "--since: shows fetch attempt and hint when commit is unavailable" {
+    make_pr_head
+
+    run "$SCRIPT" --since "deadbeef1234" 2>&1
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"Fetching deadbeef1234 from"* ]]
+    [[ "$output" == *"not available locally"* ]]
+    [[ "$output" == *"tried fetching from"* ]]
+}
+
+@test "--since and --since-ack are mutually exclusive" {
+    make_pr_head
+
+    run "$SCRIPT" --since-ack --since deadbeef 2>&1
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"mutually exclusive"* ]]
+}
+
 @test "--since-ack: ACK comment with SHA runs range-diff" {
     # Create old version of the PR commit (the one that was ACK'd)
     echo "old pr work" > pr.txt && git add pr.txt

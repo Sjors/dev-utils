@@ -25,8 +25,12 @@ In the default mode the "old" side is the pushed remote ref (@{push}) and the
 With --since-ack the "old" side is the commit you last ACK'd (or utACK'd) in a
 PR comment. Useful when re-reviewing a PR after a force-push.
 
+With --since HASH the "old" side is the specified commit. Like --since-ack but
+without the GitHub lookup — useful when you know the commit hash already.
+
 Options:
       --since-ack   range-diff from last ACK'd commit instead of @{push}
+      --since HASH  range-diff from the specified commit instead of @{push}
   -h, --help        display this help and exit
       --version     output version information and exit
 
@@ -94,6 +98,7 @@ owner_from_url() {
 # ---------------------------------------------------------------------------
 
 since_ack=false
+since_hash=""
 range_diff_args=()
 
 while (( $# > 0 )); do
@@ -101,10 +106,14 @@ while (( $# > 0 )); do
         -h|--help) usage; exit 0 ;;
         --version) printf 'git-range-diff-remote\n'; exit 0 ;;
         --since-ack) since_ack=true; shift ;;
+        --since) shift; [[ $# -gt 0 ]] || die "--since requires a commit hash argument"; since_hash="$1"; shift ;;
+        --since=*) since_hash="${1#--since=}"; shift ;;
         --) shift; range_diff_args+=("$@"); break ;;
         *) range_diff_args+=("$1"); shift ;;
     esac
 done
+
+"$since_ack" && [[ -n "$since_hash" ]] && die "--since-ack and --since are mutually exclusive"
 
 command -v git >/dev/null || die "git is required"
 command -v gh  >/dev/null || die "gh is required"
@@ -112,6 +121,45 @@ command -v jq  >/dev/null || die "jq is required"
 
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "Not inside a git repository"
 ensure_branch_context
+
+# ---------------------------------------------------------------------------
+# Run range-diff from a known $prev commit to HEAD.
+# Fetches $prev from $fetch_remote if not available locally (empty = skip fetch).
+# ---------------------------------------------------------------------------
+run_from_prev() {
+    local prev="$1" n="${2:-}" fetch_remote="${3:-}"
+
+    if ! git rev-parse --verify --quiet "$prev^{commit}" >/dev/null; then
+        if [[ -n "$fetch_remote" ]]; then
+            printf 'Fetching %s from %s...\n' "$prev" "$fetch_remote" >&2
+            git fetch --no-tags "$fetch_remote" "$prev" 2>&1 || true
+        fi
+    fi
+    if ! git rev-parse --verify --quiet "$prev^{commit}" >/dev/null; then
+        local hint=""
+        [[ -n "$fetch_remote" ]] \
+            && hint=" (tried fetching from $fetch_remote)" \
+            || hint="; no remote configured to fetch from"
+        die "Commit $prev is not available locally$hint"
+    fi
+
+    local mb
+    mb="$(git merge-base --all HEAD "$prev")" || die "Failed to compute merge-base"
+    [[ -n "$mb" ]] || die "No merge-base found between HEAD and $prev"
+
+    local prev_full
+    prev_full="$(git rev-parse "$prev^{commit}")"
+    [[ "$mb" != "$prev_full" ]] \
+        || die "$prev is an ancestor of HEAD — nothing to range-diff. Provide an older PR tip from before a force-push, not a commit already in the current branch."
+
+    # Use HEAD~n..HEAD for the new range to exclude any base-branch commits
+    # that were incorporated when the PR was rebased. When n isn't provided
+    # (--since mode), estimate it from the old range.
+    [[ -n "$n" ]] || n="$(git rev-list --count "$mb..$prev")"
+
+    printf 'Using PREV=%s N=%s\n' "$prev" "$n" >&2
+    git range-diff "$mb...$prev" "HEAD~$n..HEAD" "${range_diff_args[@]}"
+}
 
 # ---------------------------------------------------------------------------
 
@@ -144,7 +192,7 @@ if "$since_ack"; then
     local_head="$(git rev-parse --verify HEAD^{commit})"
 
     if [[ -n "$pr_head" && "$local_head" != "$pr_head" ]]; then
-        stale_hint="git fetch --no-tags $tracking_remote $tracking_branch && git merge --ff-only $tracking_ref"
+        stale_hint="git fetch --no-tags $tracking_remote $tracking_branch && git checkout $tracking_ref"
         die "Local HEAD $local_head does not match PR head $pr_head. Update first (e.g. $stale_hint)."
     fi
 
@@ -184,17 +232,20 @@ if "$since_ack"; then
     [[ "$n" =~ ^[0-9]+$ ]] || die "Invalid PR commit count: $n"
     (( n > 0 )) || die "PR commit count is zero"
 
-    # Fetch the ACK'd commit if not available locally
-    if ! git rev-parse --verify --quiet "$prev^{commit}" >/dev/null; then
-        git fetch --no-tags "$tracking_remote" "$prev" >/dev/null 2>&1 || true
+    run_from_prev "$prev" "$n" "$tracking_remote"
+
+elif [[ -n "$since_hash" ]]; then
+    # -------------------------------------------------------------------
+    # --since mode: range-diff from a caller-specified commit
+    # -------------------------------------------------------------------
+
+    tracking_ref="$(git rev-parse --abbrev-ref --symbolic-full-name @{upstream} 2>/dev/null || true)"
+    if [[ -z "$tracking_ref" && -n "$_inferred_tracking" ]]; then
+        tracking_ref="$_inferred_tracking"
     fi
-    git rev-parse --verify --quiet "$prev^{commit}" >/dev/null || die "ACK commit $prev is not available locally"
+    tracking_remote="${tracking_ref%%/*}"
 
-    mb="$(git merge-base --all HEAD "$prev")" || die "Failed to compute merge-base"
-    [[ -n "$mb" ]] || die "No merge-base found between HEAD and $prev"
-
-    printf 'Using PREV=%s N=%s\n' "$prev" "$n" >&2
-    git range-diff "$mb...$prev" "$mb...HEAD" "${range_diff_args[@]}"
+    run_from_prev "$since_hash" "" "$tracking_remote"
 
 else
     # -------------------------------------------------------------------

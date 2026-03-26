@@ -14,10 +14,16 @@ In the default mode the "old" side is the pushed remote ref (@{push}) and the
 .PP
 With \fB\-\-since\-ack\fR the "old" side is the commit you last ACK'd (or utACK'd) in a
 PR comment. Useful when re\-reviewing a PR after a force\-push.
+.PP
+With \fB\-\-since\fR \fIHASH\fR the "old" side is the specified commit. Like \fB\-\-since\-ack\fR
+but without the GitHub lookup \(em useful when you know the commit hash already.
 .SH OPTIONS
 .TP
 \fB\-\-since\-ack\fR
 range\-diff from last ACK'd commit instead of @{push}
+.TP
+\fB\-\-since\fR \fIHASH\fR
+range\-diff from the specified commit instead of @{push}
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 display this help and exit
