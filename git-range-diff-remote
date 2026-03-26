@@ -10,6 +10,8 @@ die() {
     exit 1
 }
 
+_inferred_tracking=""  # set by ensure_branch_context when detached but inferable
+
 usage() {
     cat <<'EOF'
 Usage: git range-diff-remote [OPTION]... [RANGE-DIFF-OPTION]...
@@ -21,8 +23,7 @@ In the default mode the "old" side is the pushed remote ref (@{push}) and the
 "new" side is local HEAD. Useful for reviewing local changes before pushing.
 
 With --since-ack the "old" side is the commit you last ACK'd (or utACK'd) in a
-PR comment, falling back to your previous review push if no ACK is found.
-Useful when re-reviewing a PR after a force-push.
+PR comment. Useful when re-reviewing a PR after a force-push.
 
 Options:
       --since-ack   range-diff from last ACK'd commit instead of @{push}
@@ -58,9 +59,8 @@ ensure_branch_context() {
         die "${msg%$'\n'}"
     fi
 
-    local remote_ref="${remote_refs[0]}"
-    local suggested="${remote_ref#*/}"
-    die "Detached HEAD; did you mean:"$'\n'"  git checkout $suggested"
+    # Exactly one remote ref — infer tracking from it (used by --since-ack)
+    _inferred_tracking="${remote_refs[0]}"
 }
 
 # Find the PR number for a given remote owner and branch name.
@@ -121,6 +121,9 @@ if "$since_ack"; then
     # -------------------------------------------------------------------
 
     tracking_ref="$(git rev-parse --abbrev-ref --symbolic-full-name @{upstream} 2>/dev/null || true)"
+    if [[ -z "$tracking_ref" && -n "$_inferred_tracking" ]]; then
+        tracking_ref="$_inferred_tracking"
+    fi
     [[ -n "$tracking_ref" ]] || die "No upstream ref configured for current branch"
 
     tracking_remote="${tracking_ref%%/*}"
@@ -175,40 +178,7 @@ if "$since_ack"; then
         '
     )" || die "Failed to parse ACK hash from PR metadata"
 
-    prev_source="ack"
-    if [[ -z "$prev" ]]; then
-        prev="$(
-            printf '%s\n' "$pr_json" | jq -r --arg login "$login" '
-                [
-                    .reviews[]?
-                    | {
-                        at: (.submittedAt // .updatedAt // .createdAt // ""),
-                        author: (.author.login // ""),
-                        review_sha: (.commit.oid // "")
-                    }
-                    | select(.author == $login and (.review_sha | length) > 0)
-                ]
-                | sort_by(.at) as $reviews
-                | (($reviews[-1].review_sha) // empty) as $latest_review_sha
-                | if ($latest_review_sha | length) == 0 then
-                    empty
-                  else
-                    (
-                        $reviews
-                        | reverse
-                        | .[1:]
-                        | map(.review_sha)
-                        | map(select(. != $latest_review_sha))
-                        | first
-                    ) // empty
-                  end
-            '
-        )" || die "Failed to parse fallback hash from review history"
-
-        [[ -z "$prev" ]] || prev_source="previous review push"
-    fi
-
-    [[ -n "$prev" ]] || die "No ACK/utACK hash found, and no earlier reviewed commit found to use as fallback"
+    [[ -n "$prev" ]] || die "No ACK comment found for this PR. Have you ACK'd it yet?"
 
     n="$(printf '%s\n' "$pr_json" | jq -r '.commits | length')"
     [[ "$n" =~ ^[0-9]+$ ]] || die "Invalid PR commit count: $n"
@@ -223,7 +193,7 @@ if "$since_ack"; then
     mb="$(git merge-base --all HEAD "$prev")" || die "Failed to compute merge-base"
     [[ -n "$mb" ]] || die "No merge-base found between HEAD and $prev"
 
-    printf 'Using PREV=%s N=%s (%s)\n' "$prev" "$n" "$prev_source" >&2
+    printf 'Using PREV=%s N=%s\n' "$prev" "$n" >&2
     git range-diff "$mb...$prev" "$mb...HEAD" "${range_diff_args[@]}"
 
 else
@@ -237,6 +207,10 @@ else
         login="$(gh api user --jq .login 2>/dev/null || true)"
         if [[ -n "$upstream_remote" && -n "$login" && "$upstream_remote" != "$login" ]]; then
             die "No push ref configured for current branch (@{push}). This looks like someone else's PR — did you mean:"$'\n'"  git range-diff-remote --since-ack"
+        fi
+        if [[ -n "$_inferred_tracking" ]]; then
+            suggested="${_inferred_tracking#*/}"
+            die "Detached HEAD; did you mean:"$'\n'"  git checkout $suggested"
         fi
         die "No push ref configured for current branch (@{push})"
     fi
