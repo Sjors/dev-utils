@@ -5,6 +5,19 @@ on:
   pull_request:
 
 jobs:
+  manpage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install help2man
+        run: sudo apt-get update && sudo apt-get install -y help2man
+      - name: Check generated man page
+        run: |
+          help2man ./git-range-diff-remote --no-info \
+            --name "range-diff local commits against a PR's remote state" \
+            -o share/man/man1/git-range-diff-remote.1
+          git diff --exit-code -- share/man/man1/git-range-diff-remote.1
+
   bats:
     runs-on: ubuntu-latest
     steps:
