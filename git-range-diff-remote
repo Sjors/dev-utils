@@ -10,7 +10,37 @@ die() {
     exit 1
 }
 
+lower() {
+    printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
+}
+
+run_gh() {
+    if "$debug"; then
+        printf 'DEBUG gh' >&2
+        local arg
+        for arg in "$@"; do
+            printf ' %q' "$arg" >&2
+        done
+        printf '\n' >&2
+    fi
+    gh "$@"
+}
+
+ensure_gh_login() {
+    if [[ -z "$_gh_login" ]]; then
+        _gh_login="$(run_gh api user --jq .login)" || return 1
+    fi
+}
+
 _inferred_tracking=""  # set by ensure_branch_context when detached but inferable
+_current_pr_number=""
+_current_pr_json=""
+_gh_login=""
+_repo_owner=""
+_explicit_top_base=""
+_explicit_top_count=""
+_top_base_commit=""
+debug=false
 
 usage() {
     cat <<'EOF'
@@ -28,9 +58,15 @@ PR comment. Useful when re-reviewing a PR after a force-push.
 With --since HASH the "old" side is the specified commit. Like --since-ack but
 without the GitHub lookup — useful when you know the commit hash already.
 
+With --top, only compare commits that are on top of a stacked base branch. The
+base is inferred as the nearest ancestor of HEAD that is also the tip of
+another non-main branch/ref.
+
 Options:
       --since-ack   range-diff from last ACK'd commit instead of @{push}
       --since HASH  range-diff from the specified commit instead of @{push}
+      --top         only compare commits that are not in the inferred base PR
+      --debug       print gh commands before running them
   -h, --help        display this help and exit
       --version     output version information and exit
 
@@ -71,20 +107,218 @@ ensure_branch_context() {
 # Sets the global variable: pr_number
 resolve_pr() {
     local owner="$1" branch="$2"
+    local owner_lc login_lc
 
-    login="$(gh api user --jq .login)" || die "Failed to determine GitHub login via gh"
+    ensure_gh_login || die "Failed to determine GitHub login via gh"
+    login="$_gh_login"
+    owner_lc="$(lower "$owner")"
+    login_lc="$(lower "$login")"
 
-    if [[ "${owner,,}" != "${login,,}" ]]; then
-        pr_number="$(gh pr list --head "${branch}" --json number --jq '.[0].number // empty')" \
+    if [[ "$owner_lc" != "$login_lc" ]]; then
+        pr_number="$(run_gh pr list --head "${branch}" --json number --jq '.[0].number // empty')" \
             || die "Failed to look up PR for ${owner}:${branch}"
     else
-        pr_number="$(gh pr list --state open --search "head:$branch" \
+        pr_number="$(run_gh pr list --state open --search "head:$branch" \
             --json number,headRefName,headRepositoryOwner \
-            --jq ".[] | select((.headRefName | ascii_downcase) == (\"$branch\" | ascii_downcase) and (.headRepositoryOwner.login | ascii_downcase) == (\"$owner\" | ascii_downcase)) | .number" \
+            --jq ".[] | select((.headRefName | ascii_downcase) == (\"$branch\" | ascii_downcase) and (.headRepositoryOwner.login | ascii_downcase) == (\"$owner_lc\")) | .number" \
             | head -n1)" || die "Failed to resolve PR via gh"
     fi
 
     [[ -n "$pr_number" ]] || die "No open PR found for $owner:$branch"
+}
+
+load_current_pr_json() {
+    [[ -n "$_current_pr_json" ]] && return 0
+
+    local remote_ref remote owner branch url
+
+    remote_ref="$(git rev-parse --symbolic-full-name @{push} 2>/dev/null || true)"
+    if [[ -z "$remote_ref" ]]; then
+        remote_ref="$(git rev-parse --abbrev-ref --symbolic-full-name @{upstream} 2>/dev/null || true)"
+    fi
+    if [[ -z "$remote_ref" && -n "$_inferred_tracking" ]]; then
+        remote_ref="refs/remotes/$_inferred_tracking"
+    fi
+    [[ -n "$remote_ref" ]] || return 1
+
+    if [[ "$remote_ref" == refs/remotes/* ]]; then
+        remote="${remote_ref#refs/remotes/}"
+        branch="${remote#*/}"
+        remote="${remote%%/*}"
+    else
+        remote="$remote_ref"
+        branch="${remote_ref#*/}"
+    fi
+    remote="${remote%%/*}"
+
+    url="$(git remote get-url --push "$remote" 2>/dev/null || git remote get-url "$remote" 2>/dev/null)" || return 1
+    owner="$(owner_from_url "$url")" || return 1
+
+    resolve_pr "$owner" "$branch"
+    _current_pr_number="$pr_number"
+    _current_pr_json="$(run_gh pr view "$pr_number" --json body,commits,baseRefName,headRefOid,headRefName,headRepositoryOwner,comments,reviews)" \
+        || die "Failed to read PR metadata"
+}
+
+ensure_current_repo_owner() {
+    if [[ -n "$_repo_owner" ]]; then
+        return 0
+    fi
+
+    local remote_ref remote url
+
+    remote_ref="$(git rev-parse --symbolic-full-name @{push} 2>/dev/null || true)"
+    if [[ -z "$remote_ref" ]]; then
+        remote_ref="$(git rev-parse --abbrev-ref --symbolic-full-name @{upstream} 2>/dev/null || true)"
+    fi
+    if [[ -z "$remote_ref" && -n "$_inferred_tracking" ]]; then
+        remote_ref="refs/remotes/$_inferred_tracking"
+    fi
+    [[ -n "$remote_ref" ]] || return 1
+
+    if [[ "$remote_ref" == refs/remotes/* ]]; then
+        remote="${remote_ref#refs/remotes/}"
+    else
+        remote="$remote_ref"
+    fi
+    remote="${remote%%/*}"
+
+    url="$(git remote get-url --push "$remote" 2>/dev/null || git remote get-url "$remote" 2>/dev/null)" || return 1
+    _repo_owner="$(owner_from_url "$url")" || return 1
+}
+
+find_open_pr_number() {
+    local owner="$1" branch="$2"
+    local owner_lc login_lc
+
+    ensure_gh_login || return 1
+    login="$_gh_login"
+    owner_lc="$(lower "$owner")"
+    login_lc="$(lower "$login")"
+
+    if [[ "$owner_lc" != "$login_lc" ]]; then
+        run_gh pr list --head "${branch}" --json number --jq '.[0].number // empty' 2>/dev/null || true
+    else
+        run_gh pr list --state open --search "head:$branch" \
+            --json number,headRefName,headRepositoryOwner \
+            --jq ".[] | select((.headRefName | ascii_downcase) == (\"$branch\" | ascii_downcase) and (.headRepositoryOwner.login | ascii_downcase) == (\"$owner_lc\")) | .number" \
+            2>/dev/null | head -n1 || true
+    fi
+}
+
+ref_has_open_pr() {
+    local refname="$1"
+    local owner branch remote pr_num
+
+    case "$refname" in
+        refs/heads/*)
+            ensure_current_repo_owner || return 1
+            owner="$_repo_owner"
+            branch="${refname#refs/heads/}"
+            ;;
+        refs/remotes/*)
+            remote="${refname#refs/remotes/}"
+            branch="${remote#*/}"
+            remote="${remote%%/*}"
+            [[ "$branch" == "HEAD" ]] && return 1
+            owner="$(git remote get-url --push "$remote" 2>/dev/null || git remote get-url "$remote" 2>/dev/null)" || return 1
+            owner="$(owner_from_url "$owner")" || return 1
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+
+    if "$debug"; then
+        printf 'DEBUG candidate ref=%s owner=%s branch=%s\n' "$refname" "$owner" "$branch" >&2
+    fi
+    pr_num="$(find_open_pr_number "$owner" "$branch")"
+    [[ -n "$pr_num" ]]
+}
+
+top_range_base_ref() {
+    local base_branch="" remote_ref remote candidate
+
+    load_current_pr_json || return 1
+    base_branch="$(printf '%s\n' "$_current_pr_json" | jq -r '.baseRefName // empty')"
+    [[ -n "$base_branch" ]] || return 1
+
+    remote_ref="$(git rev-parse --symbolic-full-name @{push} 2>/dev/null || true)"
+    if [[ -n "$remote_ref" && "$remote_ref" == refs/remotes/* ]]; then
+        remote="${remote_ref#refs/remotes/}"
+        remote="${remote%%/*}"
+        candidate="${remote}/${base_branch}"
+        if git rev-parse --verify --quiet "$candidate^{commit}" >/dev/null; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    fi
+
+    candidate="origin/${base_branch}"
+    if git rev-parse --verify --quiet "$candidate^{commit}" >/dev/null; then
+        printf '%s\n' "$candidate"
+        return 0
+    fi
+
+    return 1
+}
+
+explicit_top_base_commit() {
+    local body base_pr base_head current_count base_count
+
+    if [[ -n "$_explicit_top_base" ]]; then
+        printf '%s\n' "$_explicit_top_base"
+        return 0
+    fi
+
+    load_current_pr_json || return 1
+    body="$(printf '%s\n' "$_current_pr_json" | jq -r '.body // empty')"
+    [[ -n "$body" ]] || return 1
+
+    base_pr="$(
+        printf '%s\n' "$body" | awk '
+            BEGIN { in_based_on = 0 }
+            tolower($0) ~ /^[[:space:]]*based on:[[:space:]]*$/ {
+                in_based_on = 1
+                next
+            }
+            in_based_on {
+                if ($0 ~ /^[[:space:]]*$/) exit
+                if (match($0, /#[0-9]+/)) {
+                    print substr($0, RSTART + 1, RLENGTH - 1)
+                    exit
+                }
+            }
+            !in_based_on && match(tolower($0), /based on:[[:space:]]*(bitcoin\/bitcoin)?#[0-9]+/) {
+                s = substr($0, RSTART, RLENGTH)
+                if (match(s, /#[0-9]+/)) {
+                    print substr(s, RSTART + 1, RLENGTH - 1)
+                    exit
+                }
+            }
+        '
+    )"
+    [[ -n "$base_pr" ]] || return 1
+
+    base_head="$(run_gh pr view "$base_pr" --json headRefOid,commits --jq '[.headRefOid // empty, (.commits | length)] | @tsv')" \
+        || die "Failed to read base PR #$base_pr"
+    base_count="${base_head#*$'\t'}"
+    base_head="${base_head%%$'\t'*}"
+    [[ -n "$base_head" ]] || die "Base PR #$base_pr does not have a head commit"
+
+    current_count="$(printf '%s\n' "$_current_pr_json" | jq -r '.commits | length')"
+    [[ "$current_count" =~ ^[0-9]+$ ]] || die "Invalid current PR commit count: $current_count"
+    [[ "$base_count" =~ ^[0-9]+$ ]] || die "Invalid base PR commit count: $base_count"
+    (( current_count > base_count )) || die "Base PR #$base_pr is not smaller than current PR"
+    _explicit_top_count="$((current_count - base_count))"
+    _explicit_top_base="$base_head"
+
+    if git merge-base --is-ancestor "$_explicit_top_base" HEAD; then
+        printf '%s\n' "$_explicit_top_base"
+        return 0
+    fi
+
+    die "Base PR #$base_pr head $_explicit_top_base is not an ancestor of HEAD"
 }
 
 # Extract GitHub owner from a remote URL.
@@ -99,6 +333,8 @@ owner_from_url() {
 
 since_ack=false
 since_hash=""
+top_only=false
+debug=false
 range_diff_args=()
 
 while (( $# > 0 )); do
@@ -108,6 +344,8 @@ while (( $# > 0 )); do
         --since-ack) since_ack=true; shift ;;
         --since) shift; [[ $# -gt 0 ]] || die "--since requires a commit hash argument"; since_hash="$1"; shift ;;
         --since=*) since_hash="${1#--since=}"; shift ;;
+        --top) top_only=true; shift ;;
+        --debug) debug=true; shift ;;
         --) shift; range_diff_args+=("$@"); break ;;
         *) range_diff_args+=("$1"); shift ;;
     esac
@@ -152,6 +390,22 @@ run_from_prev() {
     [[ "$mb" != "$prev_full" ]] \
         || die "$prev is an ancestor of HEAD — nothing to range-diff. Provide an older PR tip from before a force-push, not a commit already in the current branch."
 
+    if "$top_only"; then
+        local top_base old_base top_count=""
+        infer_top_base_commit || exit $?
+        top_base="$_top_base_commit"
+        top_count="${_explicit_top_count:-}"
+        if [[ -n "$top_count" ]]; then
+            printf 'Using PREV=%s TOP_BASE=%s TOP_N=%s\n' "$prev" "$top_base" "$top_count" >&2
+            git range-diff "${prev}~${top_count}..${prev}" "${top_base}..HEAD" "${range_diff_args[@]}"
+        else
+            old_base="$(git merge-base "$prev" "$top_base")" || die "Failed to compute old stacked base"
+            printf 'Using PREV=%s TOP_BASE=%s\n' "$prev" "$top_base" >&2
+            git range-diff "${old_base}..${prev}" "${top_base}..HEAD" "${range_diff_args[@]}"
+        fi
+        return 0
+    fi
+
     # Use HEAD~n..HEAD for the new range to exclude any base-branch commits
     # that were incorporated when the PR was rebased. When n isn't provided
     # (--since mode), estimate it from the old range.
@@ -159,6 +413,111 @@ run_from_prev() {
 
     printf 'Using PREV=%s N=%s\n' "$prev" "$n" >&2
     git range-diff "$mb...$prev" "HEAD~$n..HEAD" "${range_diff_args[@]}"
+}
+
+is_mainline_ref() {
+    local refname="$1" short
+    short="${refname##*/}"
+    case "$short" in
+        HEAD|master|main|trunk|develop|development|next|latest|31.x|32.x|33.x)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+infer_top_base_commit() {
+    local explicit_base
+
+    _top_base_commit=""
+    if explicit_top_base_commit >/dev/null 2>/dev/null; then
+        explicit_base="$_explicit_top_base"
+    else
+        explicit_base=""
+    fi
+    if "$debug"; then
+        printf 'DEBUG explicit_top_base=%s\n' "${explicit_base:-<empty>}" >&2
+    fi
+    if [[ -n "$explicit_base" ]]; then
+        _top_base_commit="$explicit_base"
+        return 0
+    fi
+
+    local head current_branch push_ref upstream_ref push_commit="" upstream_commit="" push_remote="" range_base="" range_base_sha=""
+    local -a candidates=()
+    local refname commit distance best_commit=""
+    local best_distance=-1
+
+    head="$(git rev-parse HEAD)"
+    current_branch="$(git symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+    push_ref="$(git rev-parse --symbolic-full-name @{push} 2>/dev/null || true)"
+    upstream_ref="$(git rev-parse --symbolic-full-name @{upstream} 2>/dev/null || true)"
+
+    [[ -n "$push_ref" ]] && push_commit="$(git rev-parse "$push_ref")"
+    if [[ -n "$push_ref" && "$push_ref" == refs/remotes/* ]]; then
+        push_remote="${push_ref#refs/remotes/}"
+        push_remote="${push_remote%%/*}"
+    fi
+    [[ -n "$upstream_ref" ]] && upstream_commit="$(git rev-parse "$upstream_ref")"
+    range_base="$(top_range_base_ref 2>/dev/null || true)"
+    [[ -n "$range_base" ]] && range_base_sha="$(git rev-parse "$range_base")"
+
+    if [[ -n "$range_base_sha" ]]; then
+        while read -r commit; do
+            [[ -n "$commit" ]] || continue
+            while read -r refname ref_commit; do
+                [[ -n "$refname" && -n "$ref_commit" ]] || continue
+                [[ "$refname" == "refs/remotes/"*"/HEAD" ]] && continue
+                if [[ "$refname" == refs/remotes/* && -n "$push_remote" && "$refname" != refs/remotes/"$push_remote"/* ]]; then
+                    continue
+                fi
+                [[ -n "$current_branch" && "$refname" == "refs/heads/$current_branch" ]] && continue
+                [[ -n "$push_ref" && "$refname" == "$push_ref" ]] && continue
+                [[ -n "$upstream_ref" && "$refname" == "$upstream_ref" ]] && continue
+                is_mainline_ref "$refname" && continue
+                [[ "$ref_commit" == "$head" ]] && continue
+                [[ -n "$push_commit" && "$ref_commit" == "$push_commit" ]] && continue
+                [[ -n "$upstream_commit" && "$ref_commit" == "$upstream_commit" ]] && continue
+                ref_has_open_pr "$refname" || continue
+                candidates+=("$ref_commit")
+            done < <(git for-each-ref --format='%(refname) %(objectname)' --points-at "$commit" refs/heads refs/remotes)
+        done < <(git rev-list --ancestry-path "${range_base_sha}..HEAD")
+    else
+        while read -r refname commit; do
+            [[ -n "$refname" && -n "$commit" ]] || continue
+            [[ "$refname" == "refs/remotes/"*"/HEAD" ]] && continue
+            if [[ "$refname" == refs/remotes/* && -n "$push_remote" && "$refname" != refs/remotes/"$push_remote"/* ]]; then
+                continue
+            fi
+            [[ -n "$current_branch" && "$refname" == "refs/heads/$current_branch" ]] && continue
+            [[ -n "$push_ref" && "$refname" == "$push_ref" ]] && continue
+            [[ -n "$upstream_ref" && "$refname" == "$upstream_ref" ]] && continue
+            is_mainline_ref "$refname" && continue
+            [[ "$commit" == "$head" ]] && continue
+            [[ -n "$push_commit" && "$commit" == "$push_commit" ]] && continue
+            [[ -n "$upstream_commit" && "$commit" == "$upstream_commit" ]] && continue
+            ref_has_open_pr "$refname" || continue
+            candidates+=("$commit")
+        done < <(git for-each-ref --format='%(refname) %(objectname)' --merged HEAD refs/heads refs/remotes)
+    fi
+
+    if (( ${#candidates[@]} == 0 )); then
+        die "Could not infer a stacked base for --top"
+    fi
+
+    while read -r commit; do
+        [[ -n "$commit" ]] || continue
+        distance="$(git rev-list --count "${commit}..HEAD")" || die "Failed to compute stacked distance"
+        [[ "$distance" =~ ^[0-9]+$ ]] || die "Invalid stacked distance: $distance"
+        (( distance > 0 )) || continue
+        if (( best_distance < 0 || distance < best_distance )); then
+            best_distance="$distance"
+            best_commit="$commit"
+        fi
+    done < <(printf '%s\n' "${candidates[@]}" | sort -u)
+
+    [[ -n "$best_commit" ]] || die "Could not infer a stacked base for --top"
+    _top_base_commit="$best_commit"
 }
 
 # ---------------------------------------------------------------------------
@@ -288,9 +647,22 @@ else
     pr_view="$(gh pr view "$pr_number" --json commits,baseRefName)" \
         || die "Failed to read PR metadata"
 
-    n_remote="$(printf '%s\n' "$pr_view" | jq -r '.commits | length')"
-    base_branch="$(printf '%s\n' "$pr_view" | jq -r '.baseRefName')"
-    n_local="$(git rev-list --count "origin/${base_branch}..HEAD")"
+    if "$top_only"; then
+        infer_top_base_commit || exit $?
+        top_base="$_top_base_commit"
+        if [[ -n "${_explicit_top_count:-}" ]]; then
+            printf 'Using PUSH=%s TOP_BASE=%s TOP_N=%s\n' "$prev" "$top_base" "$_explicit_top_count" >&2
+            git range-diff "${prev}~${_explicit_top_count}..${prev}" "${top_base}..HEAD" --creation-factor=95 "${range_diff_args[@]}"
+        else
+            remote_top_base="$(git merge-base "$prev" "$top_base")" || die "Failed to compute remote stacked base"
+            printf 'Using PUSH=%s TOP_BASE=%s\n' "$prev" "$top_base" >&2
+            git range-diff "${remote_top_base}..${prev}" "${top_base}..HEAD" --creation-factor=95 "${range_diff_args[@]}"
+        fi
+    else
+        n_remote="$(printf '%s\n' "$pr_view" | jq -r '.commits | length')"
+        base_branch="$(printf '%s\n' "$pr_view" | jq -r '.baseRefName')"
+        n_local="$(git rev-list --count "origin/${base_branch}..HEAD")"
 
-    git range-diff "${prev}~${n_remote}..${prev}" "HEAD~${n_local}..HEAD" --creation-factor=95 "${range_diff_args[@]}"
+        git range-diff "${prev}~${n_remote}..${prev}" "HEAD~${n_local}..HEAD" --creation-factor=95 "${range_diff_args[@]}"
+    fi
 fi

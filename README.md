@@ -47,7 +47,7 @@ BUILD_DIR=build-tidy-debug ~/utils/tidy-btc-mac.zsh
 
 Range-diff local commits against the remote version of a PR.
 
-Default mode compares local HEAD against the pushed remote ref (`@{push}`), useful for reviewing your own changes before pushing. `--since-ack` mode finds your last ACK/utACK comment on the PR and range-diffs from that commit, useful when re-reviewing a PR after a force-push. Handles detached HEAD automatically.
+Default mode compares local HEAD against the pushed remote ref (`@{push}`), useful for reviewing your own changes before pushing. `--since-ack` mode finds your last ACK/utACK comment on the PR and range-diffs from that commit, useful when re-reviewing a PR after a force-push. `--top` narrows the comparison to commits above an inferred stacked base branch. Handles detached HEAD automatically.
 
 Install by symlinking the script and man page:
 
@@ -61,6 +61,7 @@ ln -s ~/utils/share/man/man1/git-range-diff-remote.1  ~/share/man/man1/git-range
 ```sh
 git range-diff-remote                   # local vs pushed
 git range-diff-remote --since-ack       # local vs last ACK'd commit
+git range-diff-remote --top             # only commits above the stacked base
 git range-diff-remote --help            # full usage (man page)
 ```
 

@@ -1,0 +1,15 @@
+{
+  "body": "Feature work\n\nBased on:\n- [ ] #32876\n",
+  "commits": [
+    {"oid": "1111111111111111111111111111111111111111"},
+    {"oid": "2222222222222222222222222222222222222222"},
+    {"oid": "3333333333333333333333333333333333333333"},
+    {"oid": "%%HEAD_SHA%%"}
+  ],
+  "baseRefName": "master",
+  "headRefOid": "%%HEAD_SHA%%",
+  "headRefName": "feature-top",
+  "headRepositoryOwner": {"login": "testuser"},
+  "comments": [],
+  "reviews": []
+}

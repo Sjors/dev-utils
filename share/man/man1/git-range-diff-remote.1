@@ -15,15 +15,25 @@ In the default mode the "old" side is the pushed remote ref (@{push}) and the
 With \fB\-\-since\-ack\fR the "old" side is the commit you last ACK'd (or utACK'd) in a
 PR comment. Useful when re\-reviewing a PR after a force\-push.
 .PP
-With \fB\-\-since\fR \fIHASH\fR the "old" side is the specified commit. Like \fB\-\-since\-ack\fR
-but without the GitHub lookup \(em useful when you know the commit hash already.
+With \fB\-\-since\fR HASH the "old" side is the specified commit. Like \fB\-\-since\-ack\fR but
+without the GitHub lookup ??? useful when you know the commit hash already.
+.PP
+With \fB\-\-top\fR, only compare commits that are on top of a stacked base branch. The
+base is inferred as the nearest ancestor of HEAD that is also the tip of
+another non\-main branch/ref.
 .SH OPTIONS
 .TP
 \fB\-\-since\-ack\fR
 range\-diff from last ACK'd commit instead of @{push}
 .TP
-\fB\-\-since\fR \fIHASH\fR
+\fB\-\-since\fR HASH
 range\-diff from the specified commit instead of @{push}
+.TP
+\fB\-\-top\fR
+only compare commits that are not in the inferred base PR
+.TP
+\fB\-\-debug\fR
+print gh commands before running them
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 display this help and exit

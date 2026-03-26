@@ -28,6 +28,7 @@ setup() {
     export PATH="$MOCK_DIR:$PATH"
     export MOCK_LOGIN="testuser"
     export MOCK_PR_NUMBER="42"
+    unset MOCK_PR_JSON MOCK_BASE_PR MOCK_BASE_HEAD MOCK_OPEN_BRANCHES MOCK_HEAD_SHA MOCK_ACK_SHA
 }
 
 # Helper: create a PR commit on a detached HEAD with a single remote-tracking ref.
@@ -40,6 +41,31 @@ make_pr_head() {
     git remote add w0xlt "https://github.com/w0xlt/bitcoin.git"
     git update-ref "refs/remotes/w0xlt/ipc-submit-block" HEAD
     git checkout -q --detach HEAD
+}
+
+make_stacked_branch() {
+    git remote add origin "https://github.com/testuser/bitcoin.git"
+
+    echo "base pr 1" > stacked.txt && git add stacked.txt
+    git commit -q -m "base PR 1"
+    echo "base pr 2" >> stacked.txt && git add stacked.txt
+    git commit -q -m "base PR 2"
+    export STACK_BASE_SHA
+    STACK_BASE_SHA="$(git rev-parse HEAD)"
+
+    git branch -q stacked-base
+
+    echo "top pr 1" >> stacked.txt && git add stacked.txt
+    git commit -q -m "top PR 1"
+    echo "top pr 2" >> stacked.txt && git add stacked.txt
+    git commit -q -m "top PR 2"
+    export LOCAL_HEAD_SHA
+    LOCAL_HEAD_SHA="$(git rev-parse HEAD)"
+
+    git branch -q feature-top
+    git update-ref refs/remotes/origin/feature-top HEAD~1
+    git branch --set-upstream-to=origin/feature-top feature-top >/dev/null
+    git checkout -q feature-top
 }
 
 # ---------------------------------------------------------------------------
@@ -160,4 +186,77 @@ make_pr_head() {
     run "$SCRIPT" --since-ack 2>&1
     [ "$status" -eq 0 ]
     [[ "$output" == *"Using PREV=$ACK_SHA"* ]]
+}
+
+@test "--top: default mode only considers commits above the stacked base" {
+    make_stacked_branch
+    export MOCK_PR_JSON="$FIXTURES/pr_default.json"
+    export MOCK_OPEN_BRANCHES="feature-top stacked-base"
+
+    run "$SCRIPT" --top 2>&1
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Using PUSH="*"TOP_BASE=$STACK_BASE_SHA"* ]]
+    [[ "$output" == *"top PR 1"* ]]
+    [[ "$output" == *"top PR 2"* ]]
+    [[ "$output" != *"base PR 1"* ]]
+    [[ "$output" != *"base PR 2"* ]]
+}
+
+@test "--top: prefers explicit base PR from the PR description" {
+    make_stacked_branch
+    git branch -D stacked-base >/dev/null
+    git checkout -q --detach "$STACK_BASE_SHA"
+    echo "old top version 1" >> stacked.txt && git add stacked.txt
+    git commit -q -m "old top PR 1"
+    echo "old top version 2" >> stacked.txt && git add stacked.txt
+    git commit -q -m "old top PR 2"
+    git update-ref refs/remotes/origin/feature-top HEAD
+    git checkout -q feature-top
+    export MOCK_PR_JSON="$FIXTURES/pr_with_based_on.json"
+    export MOCK_BASE_PR="32876"
+    export MOCK_BASE_HEAD="$STACK_BASE_SHA"
+    export MOCK_BASE_COUNT="2"
+
+    run "$SCRIPT" --top 2>&1
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Using PUSH="*"TOP_BASE=$STACK_BASE_SHA"* ]]
+    [[ "$output" == *"top PR 1"* ]]
+    [[ "$output" == *"top PR 2"* ]]
+    [[ "$output" != *"base PR 1"* ]]
+    [[ "$output" != *"base PR 2"* ]]
+}
+
+@test "--top: since mode only considers commits above the stacked base" {
+    make_stacked_branch
+    export MOCK_OPEN_BRANCHES="feature-top stacked-base"
+
+    git checkout -q --detach "$STACK_BASE_SHA"
+    echo "old top version 1" >> stacked.txt && git add stacked.txt
+    git commit -q -m "old top PR 1"
+    echo "old top version 2" >> stacked.txt && git add stacked.txt
+    git commit -q -m "old top PR 2"
+    export OLD_TOP_SHA
+    OLD_TOP_SHA="$(git rev-parse HEAD)"
+    git checkout -q feature-top
+    export MOCK_PR_JSON="$FIXTURES/pr_with_based_on.json"
+    export MOCK_BASE_PR="32876"
+    export MOCK_BASE_HEAD="$STACK_BASE_SHA"
+    export MOCK_BASE_COUNT="2"
+
+    run "$SCRIPT" --since "$OLD_TOP_SHA" --top 2>&1
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Using PREV=$OLD_TOP_SHA TOP_BASE=$STACK_BASE_SHA"* ]]
+    [[ "$output" == *"top PR 2"* ]]
+    [[ "$output" != *"base PR 1"* ]]
+    [[ "$output" != *"base PR 2"* ]]
+}
+
+@test "--top: heuristic ignores local ancestor branches without an open PR" {
+    make_stacked_branch
+    export MOCK_PR_JSON="$FIXTURES/pr_default.json"
+    export MOCK_OPEN_BRANCHES="feature-top"
+
+    run "$SCRIPT" --top 2>&1
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"Could not infer a stacked base for --top"* ]]
 }
