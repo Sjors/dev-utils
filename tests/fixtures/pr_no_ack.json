@@ -1,0 +1,8 @@
+{
+  "comments": [],
+  "reviews": [],
+  "commits": [{"oid": "%%HEAD_SHA%%"}],
+  "headRefOid": "%%HEAD_SHA%%",
+  "headRefName": "ipc-submit-block",
+  "headRepositoryOwner": {"login": "w0xlt"}
+}

@@ -74,3 +74,10 @@ cd ~/bitcoin
 ~/utils/guix-try --bitcoind # CLI binaries
 ~/utils/guix-try --help     # all options and environment variables
 ```
+
+## Tests
+
+```sh
+brew install bats-core
+bats tests/
+```
