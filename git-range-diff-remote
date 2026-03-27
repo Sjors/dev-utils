@@ -70,8 +70,8 @@ Options:
   -h, --help        display this help and exit
       --version     output version information and exit
 
-Any unrecognised options (e.g. --creation-factor, --no-color) are forwarded
-to git-range-diff(1).
+Pass git-range-diff(1) options after `--` (e.g. `git range-diff-remote --
+--creation-factor=95 --no-color`). Unknown top-level options are rejected.
 
 Requirements: git, gh, jq
 EOF
@@ -347,7 +347,8 @@ while (( $# > 0 )); do
         --top) top_only=true; shift ;;
         --debug) debug=true; shift ;;
         --) shift; range_diff_args+=("$@"); break ;;
-        *) range_diff_args+=("$1"); shift ;;
+        -*) die "Unknown option: $1"$'\n'"Pass git-range-diff options after --" ;;
+        *) die "Unknown argument: $1" ;;
     esac
 done
 

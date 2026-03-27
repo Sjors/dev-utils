@@ -41,7 +41,7 @@ display this help and exit
 \fB\-\-version\fR
 output version information and exit
 .PP
-Any unrecognised options (e.g. \fB\-\-creation\-factor\fR, \fB\-\-no\-color\fR) are forwarded
-to git\-range\-diff(1).
+Pass git\-range\-diff(1) options after `\-\-` (e.g. `git range\-diff\-remote \fB\-\-\fR
+\fB\-\-creation\-factor\fR=\fI\,95\/\fR \fB\-\-no\-color\fR`). Unknown top\-level options are rejected.
 .PP
 Requirements: git, gh, jq

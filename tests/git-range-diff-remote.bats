@@ -161,6 +161,15 @@ make_stacked_branch() {
     [[ "$output" == *"mutually exclusive"* ]]
 }
 
+@test "unknown top-level git-range-diff option is rejected with guidance" {
+    make_pr_head
+
+    run "$SCRIPT" --no-color 2>&1
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"Unknown option: --no-color"* ]]
+    [[ "$output" == *"Pass git-range-diff options after --"* ]]
+}
+
 @test "--since-ack: ACK comment with SHA runs range-diff" {
     # Create old version of the PR commit (the one that was ACK'd)
     echo "old pr work" > pr.txt && git add pr.txt
