@@ -12,15 +12,20 @@ MODE="desktop"
 
 usage() {
     cat >&2 <<EOF
-Usage: $(basename "$0") [--signed] [--bitcoind | --desktop]
+Usage: $(basename "$0") [--signed] [--bitcoind | --desktop] [version]
 
 Fetch a macOS guix build from $REMOTE, extract, ad hoc codesign, and open in Finder.
-Auto-detects arm64 vs x86_64 from the current machine.
+Auto-detects arm64 vs x86_64 from the current machine. If no version is passed,
+the current repo state is used: exact tag name without the leading "v", or the
+current short commit hash.
 
 Options:
   --signed    Fetch the codesigned build (typically a release tag)
   --bitcoind  Fetch the .tar.gz with CLI binaries (bitcoind, bitcoin-cli, etc.)
   --desktop   Fetch the .zip with Bitcoin-Qt.app (default)
+
+Arguments:
+  version     Optional version/tag/commit to fetch (e.g. v31.0rc2 or 31.0rc2)
 
 Environment:
   REMOTE       SSH host (default: guix)
@@ -31,21 +36,47 @@ EOF
 }
 
 SIGNED=0
+VERSION_ARG=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --signed)   SIGNED=1; shift ;;
         --bitcoind) MODE="bitcoind"; shift ;;
         --desktop)  MODE="desktop"; shift ;;
         -h|--help)  usage ;;
-        *)          echo "Unknown option: $1" >&2; usage ;;
+        --)         shift; break ;;
+        -*)
+            echo "Unknown option: $1" >&2
+            usage
+            ;;
+        *)
+            if [[ -n "$VERSION_ARG" ]]; then
+                echo "Only one version argument may be provided" >&2
+                usage
+            fi
+            VERSION_ARG="$1"
+            shift
+            ;;
     esac
 done
 
-# Use tag version if on a tag, otherwise short commit hash
-if TAG=$(git describe --exact-match HEAD 2>/dev/null); then
-    V="${TAG#v}"
+if [[ $# -gt 0 ]]; then
+    echo "Unexpected extra arguments: $*" >&2
+    usage
+fi
+
+# Use explicit version if provided. Otherwise, use tag version if on a tag,
+# or fall back to the short commit hash from the current repo.
+if [[ -n "$VERSION_ARG" ]]; then
+    V="${VERSION_ARG#v}"
 else
-    V=$(git rev-parse --short=12 HEAD)
+    if TAG=$(git describe --exact-match HEAD 2>/dev/null); then
+        V="${TAG#v}"
+    elif git rev-parse --git-dir >/dev/null 2>&1; then
+        V=$(git rev-parse --short=12 HEAD)
+    else
+        echo "No version provided and current directory is not a git repository" >&2
+        usage
+    fi
 fi
 
 DISTNAME="bitcoin-${V}"
