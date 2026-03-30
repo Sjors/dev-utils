@@ -474,6 +474,30 @@ run_from_prev() {
         return 0
     fi
 
+    # If both tips are 2-parent merge commits and the old side balloons far
+    # beyond the current PR width, compare the merged payload side directly.
+    # This handles subtree-style PR branches that were rebased backwards onto
+    # an older base, where mb..prev would otherwise include many unrelated
+    # base-branch commits.
+    if [[ -n "$n" ]] \
+        && git rev-parse --verify --quiet HEAD^2 >/dev/null \
+        && git rev-parse --verify --quiet "${prev}^2" >/dev/null \
+        && ! git rev-parse --verify --quiet HEAD^3 >/dev/null \
+        && ! git rev-parse --verify --quiet "${prev}^3" >/dev/null; then
+        local old_span new_span prev_payload_count head_payload_count
+        old_span="$(git rev-list --count "$mb..$prev")" || die "Failed to count commits on old side"
+        new_span="$(git rev-list --count "$mb..HEAD")" || die "Failed to count commits on new side"
+        prev_payload_count="$(git rev-list --count "${prev}^1..${prev}^2")" || die "Failed to count previous merge payload commits"
+        head_payload_count="$(git rev-list --count "HEAD^1..HEAD^2")" || die "Failed to count current merge payload commits"
+
+        if (( prev_payload_count > 0 && head_payload_count > 0 && old_span > n + prev_payload_count && new_span <= n + head_payload_count )); then
+            printf 'Warning: PR appears to have been rebased onto an older commit; comparing merge payload only.\n' >&2
+            printf 'Using PREV=%s MERGE_PAYLOAD=1\n' "$prev" >&2
+            git range-diff "${prev}^1..${prev}^2" "HEAD^1..HEAD^2" "${range_diff_args[@]}"
+            return 0
+        fi
+    fi
+
     # Use HEAD~n..HEAD for the new range to exclude any base-branch commits
     # that were incorporated when the PR was rebased. When n isn't provided
     # (--since mode), estimate it from the old range.

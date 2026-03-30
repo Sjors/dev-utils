@@ -69,6 +69,45 @@ make_stacked_branch() {
     git checkout -q feature-top
 }
 
+make_rebased_merge_pr() {
+    git remote add w0xlt "https://github.com/w0xlt/bitcoin.git"
+
+    git checkout -q -b old-base
+    echo "base 1" >> base.txt && git add base.txt
+    git commit -q -m "base 1"
+    echo "base 2" >> base.txt && git add base.txt
+    git commit -q -m "base 2"
+    echo "base 3" >> base.txt && git add base.txt
+    git commit -q -m "base 3"
+    export OLD_BASE_SHA
+    OLD_BASE_SHA="$(git rev-parse HEAD)"
+
+    git checkout -q -b old-payload "$BASE_SHA"
+    echo "old payload" > payload.txt && git add payload.txt
+    git commit -q -m "old payload"
+    export OLD_PAYLOAD_SHA
+    OLD_PAYLOAD_SHA="$(git rev-parse HEAD)"
+
+    git checkout -q -b pr-branch "$OLD_BASE_SHA"
+    git merge --no-ff -q -m "merge old payload" "$OLD_PAYLOAD_SHA"
+    export ACK_SHA
+    ACK_SHA="$(git rev-parse HEAD)"
+
+    git checkout -q -B new-payload "$BASE_SHA"
+    echo "new payload" > payload.txt && git add payload.txt
+    git commit -q -m "new payload"
+    export NEW_PAYLOAD_SHA
+    NEW_PAYLOAD_SHA="$(git rev-parse HEAD)"
+
+    git checkout -q -B pr-branch "$BASE_SHA"
+    git merge --no-ff -q -m "merge new payload" "$NEW_PAYLOAD_SHA"
+    export PR_SHA
+    PR_SHA="$(git rev-parse HEAD)"
+
+    git update-ref "refs/remotes/w0xlt/ipc-submit-block" HEAD
+    git checkout -q --detach HEAD
+}
+
 # ---------------------------------------------------------------------------
 # Detached HEAD behaviour
 # ---------------------------------------------------------------------------
@@ -234,6 +273,24 @@ make_stacked_branch() {
     run "$SCRIPT" --since-ack 2>&1
     [ "$status" -eq 0 ]
     [[ "$output" == *"Using PREV=$ACK_SHA"* ]]
+}
+
+@test "--since-ack: merge-tip PR rebased backwards compares merge payload only" {
+    make_rebased_merge_pr
+
+    export MOCK_HEAD_SHA="$PR_SHA"
+    export MOCK_ACK_SHA="$ACK_SHA"
+    export MOCK_PR_JSON="$FIXTURES/pr_with_ack.json"
+
+    run "$SCRIPT" --since-ack 2>&1
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Warning: PR appears to have been rebased onto an older commit"* ]]
+    [[ "$output" == *"Using PREV=$ACK_SHA MERGE_PAYLOAD=1"* ]]
+    [[ "$output" == *"old payload"* ]]
+    [[ "$output" == *"new payload"* ]]
+    [[ "$output" != *"base 1"* ]]
+    [[ "$output" != *"base 2"* ]]
+    [[ "$output" != *"base 3"* ]]
 }
 
 @test "--top: default mode only considers commits above the stacked base" {
