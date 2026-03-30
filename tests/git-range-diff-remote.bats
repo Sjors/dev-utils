@@ -28,7 +28,8 @@ setup() {
     export PATH="$MOCK_DIR:$PATH"
     export MOCK_LOGIN="testuser"
     export MOCK_PR_NUMBER="42"
-    unset MOCK_PR_JSON MOCK_BASE_PR MOCK_BASE_HEAD MOCK_OPEN_BRANCHES MOCK_HEAD_SHA MOCK_ACK_SHA
+    unset MOCK_PR_NUMBERS MOCK_PR_JSON MOCK_BASE_PR MOCK_BASE_HEAD MOCK_OPEN_BRANCHES
+    unset MOCK_HEAD_SHA MOCK_ACK_SHA MOCK_VIEW_PR_NUMBER MOCK_VIEW_HEAD_REF_NAME MOCK_VIEW_HEAD_REPO_OWNER
 }
 
 # Helper: create a PR commit on a detached HEAD with a single remote-tracking ref.
@@ -106,6 +107,18 @@ make_stacked_branch() {
     [[ "$output" != *"Detached HEAD"* ]]
 }
 
+@test "--since-ack: detached HEAD prefers canonical branch over .N-rebase ref" {
+    make_pr_head
+    git update-ref "refs/remotes/w0xlt/ipc-submit-block.5-rebase" HEAD
+    export MOCK_HEAD_SHA="$PR_SHA"
+    export MOCK_PR_JSON="$FIXTURES/pr_no_ack.json"
+
+    run "$SCRIPT" --since-ack 2>&1
+    [ "$status" -eq 1 ]
+    [[ "$output" != *"Detached HEAD"* ]]
+    [[ "$output" == *"No ACK comment found"* ]]
+}
+
 @test "--since-ack: no ACK in PR exits with clear message" {
     make_pr_head
     export MOCK_HEAD_SHA="$PR_SHA"
@@ -114,6 +127,32 @@ make_stacked_branch() {
     run "$SCRIPT" --since-ack 2>&1
     [ "$status" -eq 1 ]
     [[ "$output" == *"No ACK comment found"* ]]
+}
+
+@test "--since-ack: ambiguous PRs require --pr" {
+    make_pr_head
+    export MOCK_PR_NUMBERS="34804 34952"
+
+    run "$SCRIPT" --since-ack 2>&1
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"Ambiguous pull request"* ]]
+    [[ "$output" == *"--pr 34804"* ]]
+    [[ "$output" == *"--pr 34952"* ]]
+}
+
+@test "--since-ack: --pr selects one ambiguous PR" {
+    make_pr_head
+    export MOCK_PR_NUMBERS="34804 34952"
+    export MOCK_VIEW_PR_NUMBER="34952"
+    export MOCK_VIEW_HEAD_REF_NAME="ipc-submit-block"
+    export MOCK_VIEW_HEAD_REPO_OWNER="w0xlt"
+    export MOCK_HEAD_SHA="$PR_SHA"
+    export MOCK_PR_JSON="$FIXTURES/pr_no_ack.json"
+
+    run "$SCRIPT" --since-ack --pr 34952 2>&1
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"No ACK comment found"* ]]
+    [[ "$output" != *"Ambiguous pull request"* ]]
 }
 
 @test "--since: runs range-diff from specified commit" {

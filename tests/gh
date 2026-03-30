@@ -2,6 +2,7 @@
 # Mock for the gh CLI. Controlled by env vars:
 #   MOCK_LOGIN       GitHub login to return (default: testuser)
 #   MOCK_PR_NUMBER   PR number to return from pr list (default: 42)
+#   MOCK_PR_NUMBERS  Whitespace-separated PR numbers to return from pr list
 #   MOCK_PR_JSON     Path to fixture file for pr view (required for pr view calls)
 #   MOCK_BASE_PR     PR number used as the explicit stacked base
 #   MOCK_BASE_HEAD   headRefOid returned for MOCK_BASE_PR
@@ -13,6 +14,12 @@ args="$*"
 if [[ "$args" == *"api user"* ]]; then
     printf '%s\n' "${MOCK_LOGIN:-testuser}"
 elif [[ "$args" == *"pr list"* ]]; then
+    if [[ -n "${MOCK_PR_NUMBERS:-}" ]]; then
+        for pr in ${MOCK_PR_NUMBERS}; do
+            printf '%s\n' "$pr"
+        done
+        exit 0
+    fi
     if [[ -n "${MOCK_OPEN_BRANCHES:-}" ]]; then
         branch=""
         if [[ "$args" == *"--search head:"* ]]; then
@@ -36,6 +43,13 @@ elif [[ "$args" == *"pr list"* ]]; then
     fi
     printf '%s\n' "${MOCK_PR_NUMBER:-42}"
 elif [[ "$args" == *"pr view"* ]]; then
+    if [[ "$args" == *"--json number,headRefName,headRepositoryOwner"* ]]; then
+        printf '{"number":%s,"headRefName":"%s","headRepositoryOwner":{"login":"%s"}}\n' \
+            "${MOCK_VIEW_PR_NUMBER:-${MOCK_PR_NUMBER:-42}}" \
+            "${MOCK_VIEW_HEAD_REF_NAME:-ipc-submit-block}" \
+            "${MOCK_VIEW_HEAD_REPO_OWNER:-w0xlt}"
+        exit 0
+    fi
     if [[ -n "${MOCK_BASE_PR:-}" && "$args" == *"pr view ${MOCK_BASE_PR} "* ]]; then
         if [[ "$args" == *"--jq .headRefOid // empty"* ]]; then
             printf '%s\n' "${MOCK_BASE_HEAD:?MOCK_BASE_HEAD not set}"

@@ -40,6 +40,7 @@ _repo_owner=""
 _explicit_top_base=""
 _explicit_top_count=""
 _top_base_commit=""
+explicit_pr_number=""
 debug=false
 
 usage() {
@@ -65,6 +66,7 @@ another non-main branch/ref.
 Options:
       --since-ack   range-diff from last ACK'd commit instead of @{push}
       --since HASH  range-diff from the specified commit instead of @{push}
+      --pr NUMBER   use the specified pull request instead of inferring by head branch
       --top         only compare commits that are not in the inferred base PR
       --debug       print gh commands before running them
   -h, --help        display this help and exit
@@ -90,6 +92,42 @@ ensure_branch_context() {
 
     if (( ${#remote_refs[@]} == 0 )); then
         die "Detached HEAD; check out a branch and rerun"
+    elif "$since_ack"; then
+        local ref remote branch normalized candidate preferred=""
+        local -a normalized_refs=()
+
+        for ref in "${remote_refs[@]}"; do
+            remote="${ref%%/*}"
+            branch="${ref#*/}"
+            normalized="$branch"
+            if [[ "$branch" =~ ^(.+)\.[0-9]+-rebase$ ]]; then
+                normalized="${BASH_REMATCH[1]}"
+            fi
+            candidate="$remote/$normalized"
+            if [[ "$candidate" == "$ref" ]]; then
+                continue
+            fi
+            normalized_refs+=("$candidate")
+        done
+
+        if (( ${#normalized_refs[@]} > 0 )); then
+            local normalized_ref
+            for normalized_ref in "${normalized_refs[@]}"; do
+                for ref in "${remote_refs[@]}"; do
+                    [[ "$ref" == "$normalized_ref" ]] || continue
+                    if [[ -n "$preferred" && "$preferred" != "$normalized_ref" ]]; then
+                        preferred=""
+                        break 2
+                    fi
+                    preferred="$normalized_ref"
+                done
+            done
+
+            if [[ -n "$preferred" ]]; then
+                _inferred_tracking="$preferred"
+                return 0
+            fi
+        fi
     elif (( ${#remote_refs[@]} > 1 )); then
         local msg="Detached HEAD; did you mean to check out one of these?"$'\n'
         local ref
@@ -103,27 +141,62 @@ ensure_branch_context() {
     _inferred_tracking="${remote_refs[0]}"
 }
 
+list_matching_pr_numbers() {
+    local owner="$1" branch="$2"
+    local owner_lc
+
+    owner_lc="$(lower "$owner")"
+    run_gh pr list --state open --search "head:$branch" \
+        --json number,headRefName,headRepositoryOwner \
+        --jq ".[] | select((.headRefName | ascii_downcase) == (\"$branch\" | ascii_downcase) and (.headRepositoryOwner.login | ascii_downcase) == (\"$owner_lc\")) | .number"
+}
+
 # Find the PR number for a given remote owner and branch name.
 # Sets the global variable: pr_number
 resolve_pr() {
     local owner="$1" branch="$2"
-    local owner_lc login_lc
+    local pr_numbers_raw
+    local -a pr_numbers
 
     ensure_gh_login || die "Failed to determine GitHub login via gh"
     login="$_gh_login"
-    owner_lc="$(lower "$owner")"
-    login_lc="$(lower "$login")"
 
-    if [[ "$owner_lc" != "$login_lc" ]]; then
-        pr_number="$(run_gh pr list --head "${branch}" --json number --jq '.[0].number // empty')" \
-            || die "Failed to look up PR for ${owner}:${branch}"
-    else
-        pr_number="$(run_gh pr list --state open --search "head:$branch" \
-            --json number,headRefName,headRepositoryOwner \
-            --jq ".[] | select((.headRefName | ascii_downcase) == (\"$branch\" | ascii_downcase) and (.headRepositoryOwner.login | ascii_downcase) == (\"$owner_lc\")) | .number" \
-            | head -n1)" || die "Failed to resolve PR via gh"
+    if [[ -n "$explicit_pr_number" ]]; then
+        local explicit_json explicit_owner explicit_branch
+
+        explicit_json="$(run_gh pr view "$explicit_pr_number" --json number,headRefName,headRepositoryOwner)" \
+            || die "Failed to read PR #$explicit_pr_number"
+        explicit_owner="$(printf '%s\n' "$explicit_json" | jq -r '.headRepositoryOwner.login // empty')"
+        explicit_branch="$(printf '%s\n' "$explicit_json" | jq -r '.headRefName // empty')"
+        [[ -n "$explicit_owner" && -n "$explicit_branch" ]] || die "PR #$explicit_pr_number is missing head branch metadata"
+        if [[ "$(lower "$explicit_owner")" != "$(lower "$owner")" || "$(lower "$explicit_branch")" != "$(lower "$branch")" ]]; then
+            die "PR #$explicit_pr_number does not match head branch $owner:$branch"
+        fi
+        pr_number="$explicit_pr_number"
+        return 0
     fi
 
+    pr_numbers_raw="$(list_matching_pr_numbers "$owner" "$branch")" \
+        || die "Failed to resolve PR via gh"
+    mapfile -t pr_numbers < <(printf '%s\n' "$pr_numbers_raw" | sed '/^$/d' | sort -n)
+
+    if (( ${#pr_numbers[@]} == 0 )); then
+        die "No open PR found for $owner:$branch"
+    fi
+    if (( ${#pr_numbers[@]} > 1 )); then
+        local msg="Ambiguous pull request for $owner:$branch; please specify"
+        local i
+        for i in "${!pr_numbers[@]}"; do
+            if (( i == 0 )); then
+                msg+=" --pr ${pr_numbers[i]}"
+            else
+                msg+=" or --pr ${pr_numbers[i]}"
+            fi
+        done
+        die "$msg"
+    fi
+
+    pr_number="${pr_numbers[0]}"
     [[ -n "$pr_number" ]] || die "No open PR found for $owner:$branch"
 }
 
@@ -189,21 +262,12 @@ ensure_current_repo_owner() {
 
 find_open_pr_number() {
     local owner="$1" branch="$2"
-    local owner_lc login_lc
+    local pr_num
 
     ensure_gh_login || return 1
     login="$_gh_login"
-    owner_lc="$(lower "$owner")"
-    login_lc="$(lower "$login")"
-
-    if [[ "$owner_lc" != "$login_lc" ]]; then
-        run_gh pr list --head "${branch}" --json number --jq '.[0].number // empty' 2>/dev/null || true
-    else
-        run_gh pr list --state open --search "head:$branch" \
-            --json number,headRefName,headRepositoryOwner \
-            --jq ".[] | select((.headRefName | ascii_downcase) == (\"$branch\" | ascii_downcase) and (.headRepositoryOwner.login | ascii_downcase) == (\"$owner_lc\")) | .number" \
-            2>/dev/null | head -n1 || true
-    fi
+    pr_num="$(list_matching_pr_numbers "$owner" "$branch" 2>/dev/null | head -n1 || true)"
+    [[ -n "$pr_num" ]] && printf '%s\n' "$pr_num"
 }
 
 ref_has_open_pr() {
@@ -344,6 +408,8 @@ while (( $# > 0 )); do
         --since-ack) since_ack=true; shift ;;
         --since) shift; [[ $# -gt 0 ]] || die "--since requires a commit hash argument"; since_hash="$1"; shift ;;
         --since=*) since_hash="${1#--since=}"; shift ;;
+        --pr) shift; [[ $# -gt 0 ]] || die "--pr requires a pull request number"; explicit_pr_number="$1"; shift ;;
+        --pr=*) explicit_pr_number="${1#--pr=}"; shift ;;
         --top) top_only=true; shift ;;
         --debug) debug=true; shift ;;
         --) shift; range_diff_args+=("$@"); break ;;
@@ -353,6 +419,7 @@ while (( $# > 0 )); do
 done
 
 "$since_ack" && [[ -n "$since_hash" ]] && die "--since-ack and --since are mutually exclusive"
+[[ -z "$explicit_pr_number" || "$explicit_pr_number" =~ ^[0-9]+$ ]] || die "--pr requires a numeric pull request number"
 
 command -v git >/dev/null || die "git is required"
 command -v gh  >/dev/null || die "gh is required"
