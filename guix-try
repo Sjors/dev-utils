@@ -2,35 +2,83 @@
 set -euo pipefail
 
 REMOTE="${REMOTE:-guix}"
-REMOTE_REPO="${REMOTE_REPO:-bitcoin}"
 if [[ "$(uname -m)" == "arm64" ]]; then
     HOST="${HOST:-arm64-apple-darwin}"
 else
     HOST="${HOST:-x86_64-apple-darwin}"
 fi
+OPEN_CMD="${OPEN_CMD:-open}"
 MODE="desktop"
+PROJECT="${PROJECT:-}"
+MODE_EXPLICIT=0
+
+normalize_version() {
+    local raw="$1"
+
+    case "$PROJECT" in
+        sv2-tp)
+            raw="${raw#sv2-tp-}"
+            raw="${raw#v}"
+            ;;
+        *)
+            raw="${raw#v}"
+            ;;
+    esac
+
+    printf '%s\n' "$raw"
+}
+
+codesign_targets() {
+    local target_dir="$1"
+    local -a paths=()
+
+    if [[ -d "${target_dir}/bin" ]]; then
+        while IFS= read -r path; do
+            paths+=("$path")
+        done < <(find "${target_dir}/bin" -maxdepth 1 -type f -print)
+    fi
+
+    if [[ -d "${target_dir}/libexec" ]]; then
+        while IFS= read -r path; do
+            paths+=("$path")
+        done < <(find "${target_dir}/libexec" -maxdepth 1 -type f -print)
+    fi
+
+    if [[ "${#paths[@]}" -eq 0 ]]; then
+        echo "No binaries found to ad hoc codesign in ${target_dir}" >&2
+        exit 1
+    fi
+
+    codesign -s - -f "${paths[@]}"
+}
 
 usage() {
     cat >&2 <<EOF
-Usage: $(basename "$0") [--signed] [--bitcoind | --desktop] [version]
+Usage: $(basename "$0") [--signed] [--bitcoin | --sv2-tp] [--bitcoind | --desktop] [version]
 
-Fetch a macOS guix build from $REMOTE, extract, ad hoc codesign, and open in Finder.
-Auto-detects arm64 vs x86_64 from the current machine. If no version is passed,
-the current repo state is used: exact tag name without the leading "v", or the
-current short commit hash.
+Fetch a macOS guix build from $REMOTE, extract, ad hoc codesign if needed, and
+open it in Finder. Auto-detects arm64 vs x86_64 from the current machine. If no
+version is passed, the current repo state is used: exact tag name normalized for
+the selected project, or the current short commit hash. The project defaults to
+the current checkout name when it is either "bitcoin" or "sv2-tp", otherwise
+it defaults to "bitcoin".
 
 Options:
   --signed    Fetch the codesigned build (typically a release tag)
+  --bitcoin   Use Bitcoin Core naming/layout (default)
+  --sv2-tp    Use sv2-tp naming/layout
   --bitcoind  Fetch the .tar.gz with CLI binaries (bitcoind, bitcoin-cli, etc.)
-  --desktop   Fetch the .zip with Bitcoin-Qt.app (default)
+  --desktop   Fetch the GUI archive when supported (Bitcoin Core only)
 
 Arguments:
-  version     Optional version/tag/commit to fetch (e.g. v31.0rc2 or 31.0rc2)
+  version     Optional version/tag/commit to fetch
+              Examples: v31.0rc2, 31.0rc2, v1.1.0, 1.1.0, sv2-tp-1.1.0
 
 Environment:
   REMOTE       SSH host (default: guix)
-  REMOTE_REPO  Repo path on remote (default: bitcoin)
+  REMOTE_REPO  Repo path on remote (default depends on project)
   HOST         Target triple override (e.g. x86_64-apple-darwin for Rosetta testing)
+  OPEN_CMD     Override the Finder opener command (default: open)
 EOF
     exit 1
 }
@@ -40,8 +88,10 @@ VERSION_ARG=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --signed)   SIGNED=1; shift ;;
-        --bitcoind) MODE="bitcoind"; shift ;;
-        --desktop)  MODE="desktop"; shift ;;
+        --bitcoin)  PROJECT="bitcoin"; shift ;;
+        --sv2-tp)   PROJECT="sv2-tp"; MODE="bitcoind"; shift ;;
+        --bitcoind) MODE="bitcoind"; MODE_EXPLICIT=1; shift ;;
+        --desktop)  MODE="desktop"; MODE_EXPLICIT=1; shift ;;
         -h|--help)  usage ;;
         --)         shift; break ;;
         -*)
@@ -64,13 +114,35 @@ if [[ $# -gt 0 ]]; then
     usage
 fi
 
+if [[ -z "$PROJECT" ]] && git rev-parse --git-dir >/dev/null 2>&1; then
+    REPO_BASENAME=$(basename "$(git rev-parse --show-toplevel)")
+    case "$REPO_BASENAME" in
+        bitcoin|sv2-tp)
+            PROJECT="$REPO_BASENAME"
+            ;;
+    esac
+fi
+
+PROJECT="${PROJECT:-bitcoin}"
+
+if [[ "$PROJECT" == "sv2-tp" && "$MODE_EXPLICIT" -eq 0 ]]; then
+    MODE="bitcoind"
+fi
+
+if [[ "$PROJECT" == "sv2-tp" && "$MODE" == "desktop" ]]; then
+    echo "--desktop is not supported for sv2-tp" >&2
+    usage
+fi
+
+REMOTE_REPO="${REMOTE_REPO:-$PROJECT}"
+
 # Use explicit version if provided. Otherwise, use tag version if on a tag,
 # or fall back to the short commit hash from the current repo.
 if [[ -n "$VERSION_ARG" ]]; then
-    V="${VERSION_ARG#v}"
+    V=$(normalize_version "$VERSION_ARG")
 else
     if TAG=$(git describe --exact-match HEAD 2>/dev/null); then
-        V="${TAG#v}"
+        V=$(normalize_version "$TAG")
     elif git rev-parse --git-dir >/dev/null 2>&1; then
         V=$(git rev-parse --short=12 HEAD)
     else
@@ -79,17 +151,33 @@ else
     fi
 fi
 
-DISTNAME="bitcoin-${V}"
+case "$PROJECT" in
+    bitcoin)
+        DISTNAME="bitcoin-${V}"
+        ;;
+    sv2-tp)
+        DISTNAME="sv2-tp-${V}"
+        ;;
+    *)
+        echo "Unsupported project: $PROJECT" >&2
+        exit 1
+        ;;
+esac
+
 if [[ "$SIGNED" -eq 1 ]]; then
     REMOTE_DIR="${REMOTE}:${REMOTE_REPO}/guix-build-${V}/output/${HOST}-codesigned"
 else
     REMOTE_DIR="${REMOTE}:${REMOTE_REPO}/guix-build-${V}/output/${HOST}"
 fi
-TMPDIR="/tmp/guix-try-${V}"
+TMPDIR="/tmp/guix-try-${PROJECT}-${V}"
 mkdir -p "$TMPDIR"
 
 case "${MODE}" in
     desktop)
+        if [[ "$PROJECT" != "bitcoin" ]]; then
+            echo "--desktop is only supported for bitcoin" >&2
+            exit 1
+        fi
         if [[ "$SIGNED" -eq 1 ]]; then
             ARCHIVE="${DISTNAME}-${HOST}.zip"
         else
@@ -104,7 +192,7 @@ case "${MODE}" in
             codesign -s - -f --deep "$TMPDIR/app/Bitcoin-Qt.app"
         fi
         echo "Opening in Finder..."
-        open "$TMPDIR/app"
+        "$OPEN_CMD" "$TMPDIR/app"
         ;;
     bitcoind)
         if [[ "$SIGNED" -eq 1 ]]; then
@@ -118,10 +206,10 @@ case "${MODE}" in
         tar xzf "$TMPDIR/$ARCHIVE" -C "$TMPDIR"
         if [[ "$SIGNED" -eq 0 ]]; then
             echo "Ad hoc codesigning binaries..."
-            codesign -s - -f "$TMPDIR/${DISTNAME}/bin/"* "$TMPDIR/${DISTNAME}/libexec/"*
+            codesign_targets "$TMPDIR/${DISTNAME}"
         fi
         echo "Opening in Finder..."
-        open "$TMPDIR/${DISTNAME}/bin"
+        "$OPEN_CMD" "$TMPDIR/${DISTNAME}/bin"
         ;;
 esac
 

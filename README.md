@@ -67,12 +67,20 @@ git range-diff-remote --help            # full usage (man page)
 
 ## `guix-try`
 
-Fetch a macOS guix build from a remote SSH host, extract it, ad hoc codesign it, and open it in Finder. Auto-detects arm64 vs x86_64. Run from a Bitcoin Core checkout.
+Fetch a macOS guix build from a remote SSH host, extract it, ad hoc codesign it if needed, and open it in Finder. Auto-detects arm64 vs x86_64. Run from a `bitcoin` or `sv2-tp` checkout, or select the project explicitly.
 
 ```sh
 cd ~/bitcoin
 ~/utils/guix-try            # Bitcoin-Qt.app (default)
 ~/utils/guix-try --bitcoind # CLI binaries
+
+cd ~/dev/sv2-tp
+~/utils/guix-try           # sv2-tp CLI binaries (default in sv2-tp checkout)
+~/utils/guix-try --signed 1.1.0
+
+cd ~/utils
+~/utils/guix-try --sv2-tp --signed 1.1.0
+
 ~/utils/guix-try --help     # all options and environment variables
 ```
 
