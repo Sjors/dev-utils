@@ -11,6 +11,8 @@ OPEN_CMD="${OPEN_CMD:-open}"
 MODE="desktop"
 PROJECT="${PROJECT:-}"
 MODE_EXPLICIT=0
+INSTALL=0
+INSTALL_PREFIX="/usr/local"
 
 normalize_version() {
     local raw="$1"
@@ -52,9 +54,17 @@ codesign_targets() {
     codesign -s - -f "${paths[@]}"
 }
 
+install_tree() {
+    local source_dir="$1"
+
+    echo "Installing into ${INSTALL_PREFIX}..."
+    sudo mkdir -p "${INSTALL_PREFIX}"
+    tar -C "${source_dir}" -cf - . | sudo tar --no-same-owner -m -C "${INSTALL_PREFIX}" -xf -
+}
+
 usage() {
     cat >&2 <<EOF
-Usage: $(basename "$0") [--signed] [--bitcoin | --sv2-tp] [--bitcoind | --desktop] [version]
+Usage: $(basename "$0") [--signed] [--install] [--bitcoin | --sv2-tp] [--bitcoind | --desktop] [version]
 
 Fetch a macOS guix build from $REMOTE, extract, ad hoc codesign if needed, and
 open it in Finder. Auto-detects arm64 vs x86_64 from the current machine. If no
@@ -65,6 +75,7 @@ it defaults to "bitcoin".
 
 Options:
   --signed    Fetch the codesigned build (typically a release tag)
+  --install   Install signed CLI binaries into /usr/local with sudo
   --bitcoin   Use Bitcoin Core naming/layout (default)
   --sv2-tp    Use sv2-tp naming/layout
   --bitcoind  Fetch the .tar.gz with CLI binaries (bitcoind, bitcoin-cli, etc.)
@@ -88,6 +99,7 @@ VERSION_ARG=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --signed)   SIGNED=1; shift ;;
+        --install)  INSTALL=1; MODE="bitcoind"; MODE_EXPLICIT=1; shift ;;
         --bitcoin)  PROJECT="bitcoin"; shift ;;
         --sv2-tp)   PROJECT="sv2-tp"; MODE="bitcoind"; shift ;;
         --bitcoind) MODE="bitcoind"; MODE_EXPLICIT=1; shift ;;
@@ -131,6 +143,16 @@ fi
 
 if [[ "$PROJECT" == "sv2-tp" && "$MODE" == "desktop" ]]; then
     echo "--desktop is not supported for sv2-tp" >&2
+    usage
+fi
+
+if [[ "$INSTALL" -eq 1 && "$MODE" != "bitcoind" ]]; then
+    echo "--install is only supported for CLI tarball builds" >&2
+    usage
+fi
+
+if [[ "$INSTALL" -eq 1 && "$SIGNED" -eq 0 ]]; then
+    echo "--install requires --signed" >&2
     usage
 fi
 
@@ -208,9 +230,17 @@ case "${MODE}" in
             echo "Ad hoc codesigning binaries..."
             codesign_targets "$TMPDIR/${DISTNAME}"
         fi
-        echo "Opening in Finder..."
-        "$OPEN_CMD" "$TMPDIR/${DISTNAME}/bin"
+        if [[ "$INSTALL" -eq 1 ]]; then
+            install_tree "$TMPDIR/${DISTNAME}"
+        else
+            echo "Opening in Finder..."
+            "$OPEN_CMD" "$TMPDIR/${DISTNAME}/bin"
+        fi
         ;;
 esac
 
-echo "Done. Files in $TMPDIR"
+if [[ "$INSTALL" -eq 1 ]]; then
+    echo "Done. Installed into ${INSTALL_PREFIX}; archive and extracted files are in $TMPDIR"
+else
+    echo "Done. Files in $TMPDIR"
+fi

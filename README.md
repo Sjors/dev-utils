@@ -77,6 +77,7 @@ cd ~/bitcoin
 cd ~/dev/sv2-tp
 ~/utils/guix-try           # sv2-tp CLI binaries (default in sv2-tp checkout)
 ~/utils/guix-try --signed 1.1.0
+~/utils/guix-try --install --signed 1.1.0
 
 cd ~/utils
 ~/utils/guix-try --sv2-tp --signed 1.1.0
