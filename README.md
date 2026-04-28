@@ -2,7 +2,8 @@
 
 ## `tidy-btc-mac.zsh`
 
-Run `clang-tidy` against a Bitcoin Core checkout on macOS with the SDK path wired in so Homebrew LLVM can analyze source files cleanly.
+Run `clang-tidy` against a Bitcoin Core checkout on macOS with the SDK path
+wired in so Homebrew LLVM can analyze source files cleanly.
 
 Default behavior:
 
@@ -10,7 +11,8 @@ Default behavior:
 - configures a `build_tidy` directory with `CMAKE_EXPORT_COMPILE_COMMANDS=ON`
 - detects the host CPU count with `sysctl` and passes it to `run-clang-tidy` via `-j`
 - targets `ipc/libmultiprocess/src/mp/util.cpp`
-- adds the macOS SDK path via `xcrun --show-sdk-path` so Homebrew LLVM can find system headers
+- adds the macOS SDK path via `xcrun --show-sdk-path` so Homebrew LLVM can
+  find system headers
 
 Install prerequisites with vanilla Homebrew:
 
@@ -47,7 +49,15 @@ BUILD_DIR=build-tidy-debug ~/utils/tidy-btc-mac.zsh
 
 Range-diff local commits against the remote version of a PR.
 
-Default mode compares local HEAD against the pushed remote ref (`@{push}`), useful for reviewing your own changes before pushing. PR discovery first uses the current `gh` repository context and then falls back to the pushed remote's `owner/repo`, so PRs opened against your own fork are handled too. Base branches are resolved from the pushed remote before falling back to `origin`. `--since-ack` mode finds your last ACK/utACK comment on the PR and range-diffs from that commit, useful when re-reviewing a PR after a force-push. `--top` narrows the comparison to commits above an inferred stacked base branch. Handles detached HEAD automatically.
+Default mode compares local HEAD against the pushed remote ref (`@{push}`),
+useful for reviewing your own changes before pushing. PR discovery first uses
+the current `gh` repository context and then falls back to the pushed remote's
+`owner/repo`, so PRs opened against your own fork are handled too. Base
+branches are resolved from the pushed remote before falling back to `origin`.
+`--since-ack` mode finds your last ACK/utACK comment on the PR and range-diffs
+from that commit, useful when re-reviewing a PR after a force-push. `--top`
+narrows the comparison to commits above an inferred stacked base branch.
+Handles detached HEAD automatically.
 
 Install by symlinking the script and man page:
 
@@ -55,7 +65,8 @@ Install by symlinking the script and man page:
 mkdir -p ~/bin          # ensure this is on $PATH
 mkdir -p ~/share/man/man1
 ln -s ~/utils/git-range-diff-remote                  ~/bin/git-range-diff-remote
-ln -s ~/utils/share/man/man1/git-range-diff-remote.1  ~/share/man/man1/git-range-diff-remote.1
+ln -s ~/utils/share/man/man1/git-range-diff-remote.1 \
+  ~/share/man/man1/git-range-diff-remote.1
 ```
 
 ```sh
@@ -67,7 +78,9 @@ git range-diff-remote --help            # full usage (man page)
 
 ## `guix-try`
 
-Fetch a macOS guix build from a remote SSH host, extract it, ad hoc codesign it if needed, and open it in Finder. Auto-detects arm64 vs x86_64. Run from a `bitcoin` or `sv2-tp` checkout, or select the project explicitly.
+Fetch a macOS guix build from a remote SSH host, extract it, ad hoc codesign it
+if needed, and open it in Finder. Auto-detects arm64 vs x86_64. Run from a
+`bitcoin` or `sv2-tp` checkout, or select the project explicitly.
 
 ```sh
 cd ~/bitcoin
