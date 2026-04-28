@@ -29,6 +29,7 @@ setup() {
     export MOCK_LOGIN="testuser"
     export MOCK_PR_NUMBER="42"
     unset MOCK_PR_NUMBERS MOCK_PR_JSON MOCK_BASE_PR MOCK_BASE_HEAD MOCK_OPEN_BRANCHES
+    unset MOCK_PR_REPO
     unset MOCK_HEAD_SHA MOCK_ACK_SHA MOCK_VIEW_PR_NUMBER MOCK_VIEW_HEAD_REF_NAME MOCK_VIEW_HEAD_REPO_OWNER
 }
 
@@ -246,6 +247,42 @@ make_rebased_merge_pr() {
     [ "$status" -eq 1 ]
     [[ "$output" == *"Unknown option: --no-color"* ]]
     [[ "$output" == *"Pass git-range-diff options after --"* ]]
+}
+
+@test "default mode: falls back to push remote repo for fork-owned PR" {
+    git remote add origin "https://github.com/wizardsardine/async-hwi.git"
+    git remote add sjors "git@github.com:Sjors/async-hwi.git"
+    git update-ref refs/remotes/sjors/2026/04/hwi-rs "$BASE_SHA"
+
+    git checkout -q -b 2026/04/musig
+    echo "old pr work" > pr.txt && git add pr.txt
+    git commit -q -m "old PR version"
+    git update-ref refs/remotes/sjors/2026/04/musig HEAD
+    git branch --set-upstream-to=sjors/2026/04/musig 2026/04/musig >/dev/null
+
+    git reset -q --hard "$BASE_SHA"
+    echo "new pr work" > pr.txt && git add pr.txt
+    git commit -q -m "new PR version"
+    export PR_SHA
+    PR_SHA="$(git rev-parse HEAD)"
+
+    export MOCK_PR_REPO="Sjors/async-hwi"
+    export MOCK_OPEN_BRANCHES="2026/04/musig"
+    export MOCK_PR_JSON="$FIXTURES/pr_one_commit_default.json"
+    export MOCK_HEAD_SHA="$PR_SHA"
+    export MOCK_VIEW_HEAD_REF_NAME="2026/04/musig"
+    export MOCK_VIEW_HEAD_REPO_OWNER="Sjors"
+
+    run "$SCRIPT" 2>&1
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"old PR version"* ]]
+    [[ "$output" == *"new PR version"* ]]
+
+    run "$SCRIPT" --pr 42 2>&1
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"missing --repo"* ]]
+    [[ "$output" == *"old PR version"* ]]
+    [[ "$output" == *"new PR version"* ]]
 }
 
 @test "--since-ack: ACK comment with SHA runs range-diff" {

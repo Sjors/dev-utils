@@ -37,6 +37,7 @@ _current_pr_number=""
 _current_pr_json=""
 _gh_login=""
 _repo_owner=""
+_repo_full_name=""
 _explicit_top_base=""
 _explicit_top_count=""
 _top_base_commit=""
@@ -52,6 +53,9 @@ using git-range-diff(1).
 
 In the default mode the "old" side is the pushed remote ref (@{push}) and the
 "new" side is local HEAD. Useful for reviewing local changes before pushing.
+PR discovery first uses the current gh repository context and then falls back
+to the pushed remote's owner/repo. Base branches are resolved from the pushed
+remote before falling back to origin.
 
 With --since-ack the "old" side is the commit you last ACK'd (or utACK'd) in a
 PR comment. Useful when re-reviewing a PR after a force-push.
@@ -142,43 +146,89 @@ ensure_branch_context() {
 }
 
 list_matching_pr_numbers() {
-    local owner="$1" branch="$2"
+    local owner="$1" branch="$2" repo="${3:-}"
     local owner_lc
+    local -a repo_args=()
 
     owner_lc="$(lower "$owner")"
-    run_gh pr list --state open --search "head:$branch" \
+    [[ -n "$repo" ]] && repo_args=(--repo "$repo")
+    run_gh pr list "${repo_args[@]}" --state open --search "head:$branch" \
         --json number,headRefName,headRepositoryOwner \
         --jq ".[] | select((.headRefName | ascii_downcase) == (\"$branch\" | ascii_downcase) and (.headRepositoryOwner.login | ascii_downcase) == (\"$owner_lc\")) | .number"
 }
 
+pr_metadata_matches() {
+    local json="$1" owner="$2" branch="$3"
+    local json_owner json_branch
+
+    json_owner="$(printf '%s\n' "$json" | jq -r '.headRepositoryOwner.login // empty')"
+    json_branch="$(printf '%s\n' "$json" | jq -r '.headRefName // empty')"
+    [[ -n "$json_owner" && -n "$json_branch" ]] || return 1
+    [[ "$(lower "$json_owner")" == "$(lower "$owner")" && "$(lower "$json_branch")" == "$(lower "$branch")" ]]
+}
+
+view_resolved_pr() {
+    local number="$1"
+    shift
+
+    if [[ -n "${pr_repo:-}" ]]; then
+        run_gh pr view "$number" --repo "$pr_repo" "$@"
+    else
+        run_gh pr view "$number" "$@"
+    fi
+}
+
+try_view_pr_metadata() {
+    local number="$1" repo="${2:-}"
+    local -a repo_args=()
+
+    [[ -n "$repo" ]] && repo_args=(--repo "$repo")
+    if "$debug"; then
+        run_gh pr view "$number" "${repo_args[@]}" --json number,headRefName,headRepositoryOwner
+    else
+        run_gh pr view "$number" "${repo_args[@]}" --json number,headRefName,headRepositoryOwner 2>/dev/null
+    fi
+}
+
 # Find the PR number for a given remote owner and branch name.
-# Sets the global variable: pr_number
+# Sets the global variables: pr_number, pr_repo
 resolve_pr() {
-    local owner="$1" branch="$2"
+    local owner="$1" branch="$2" repo="${3:-}"
     local pr_numbers_raw
     local -a pr_numbers
 
+    pr_repo=""
     ensure_gh_login || die "Failed to determine GitHub login via gh"
     login="$_gh_login"
 
     if [[ -n "$explicit_pr_number" ]]; then
-        local explicit_json explicit_owner explicit_branch
+        local explicit_json=""
 
-        explicit_json="$(run_gh pr view "$explicit_pr_number" --json number,headRefName,headRepositoryOwner)" \
-            || die "Failed to read PR #$explicit_pr_number"
-        explicit_owner="$(printf '%s\n' "$explicit_json" | jq -r '.headRepositoryOwner.login // empty')"
-        explicit_branch="$(printf '%s\n' "$explicit_json" | jq -r '.headRefName // empty')"
-        [[ -n "$explicit_owner" && -n "$explicit_branch" ]] || die "PR #$explicit_pr_number is missing head branch metadata"
-        if [[ "$(lower "$explicit_owner")" != "$(lower "$owner")" || "$(lower "$explicit_branch")" != "$(lower "$branch")" ]]; then
-            die "PR #$explicit_pr_number does not match head branch $owner:$branch"
+        if explicit_json="$(try_view_pr_metadata "$explicit_pr_number")" \
+            && pr_metadata_matches "$explicit_json" "$owner" "$branch"; then
+            pr_number="$explicit_pr_number"
+            return 0
         fi
-        pr_number="$explicit_pr_number"
-        return 0
+        if [[ -n "$repo" ]] \
+            && explicit_json="$(try_view_pr_metadata "$explicit_pr_number" "$repo")" \
+            && pr_metadata_matches "$explicit_json" "$owner" "$branch"; then
+            pr_number="$explicit_pr_number"
+            pr_repo="$repo"
+            return 0
+        fi
+        [[ -n "$explicit_json" ]] || die "Failed to read PR #$explicit_pr_number"
+        die "PR #$explicit_pr_number does not match head branch $owner:$branch"
     fi
 
     pr_numbers_raw="$(list_matching_pr_numbers "$owner" "$branch")" \
         || die "Failed to resolve PR via gh"
     mapfile -t pr_numbers < <(printf '%s\n' "$pr_numbers_raw" | sed '/^$/d' | sort -n)
+    if (( ${#pr_numbers[@]} == 0 )) && [[ -n "$repo" ]]; then
+        pr_numbers_raw="$(list_matching_pr_numbers "$owner" "$branch" "$repo")" \
+            || die "Failed to resolve PR via gh"
+        mapfile -t pr_numbers < <(printf '%s\n' "$pr_numbers_raw" | sed '/^$/d' | sort -n)
+        (( ${#pr_numbers[@]} == 0 )) || pr_repo="$repo"
+    fi
 
     if (( ${#pr_numbers[@]} == 0 )); then
         die "No open PR found for $owner:$branch"
@@ -203,7 +253,7 @@ resolve_pr() {
 load_current_pr_json() {
     [[ -n "$_current_pr_json" ]] && return 0
 
-    local remote_ref remote owner branch url
+    local remote_ref remote owner branch url repo
 
     remote_ref="$(git rev-parse --symbolic-full-name @{push} 2>/dev/null || true)"
     if [[ -z "$remote_ref" ]]; then
@@ -226,10 +276,11 @@ load_current_pr_json() {
 
     url="$(git remote get-url --push "$remote" 2>/dev/null || git remote get-url "$remote" 2>/dev/null)" || return 1
     owner="$(owner_from_url "$url")" || return 1
+    repo="$(repo_full_name_from_url "$url")" || return 1
 
-    resolve_pr "$owner" "$branch"
+    resolve_pr "$owner" "$branch" "$repo"
     _current_pr_number="$pr_number"
-    _current_pr_json="$(run_gh pr view "$pr_number" --json body,commits,baseRefName,headRefOid,headRefName,headRepositoryOwner,comments,reviews)" \
+    _current_pr_json="$(view_resolved_pr "$pr_number" --json body,commits,baseRefName,headRefOid,headRefName,headRepositoryOwner,comments,reviews)" \
         || die "Failed to read PR metadata"
 }
 
@@ -257,27 +308,32 @@ ensure_current_repo_owner() {
     remote="${remote%%/*}"
 
     url="$(git remote get-url --push "$remote" 2>/dev/null || git remote get-url "$remote" 2>/dev/null)" || return 1
-    _repo_owner="$(owner_from_url "$url")" || return 1
+    _repo_full_name="$(repo_full_name_from_url "$url")" || return 1
+    _repo_owner="${_repo_full_name%%/*}"
 }
 
 find_open_pr_number() {
-    local owner="$1" branch="$2"
+    local owner="$1" branch="$2" repo="${3:-}"
     local pr_num
 
     ensure_gh_login || return 1
     login="$_gh_login"
     pr_num="$(list_matching_pr_numbers "$owner" "$branch" 2>/dev/null | head -n1 || true)"
+    if [[ -z "$pr_num" && -n "$repo" ]]; then
+        pr_num="$(list_matching_pr_numbers "$owner" "$branch" "$repo" 2>/dev/null | head -n1 || true)"
+    fi
     [[ -n "$pr_num" ]] && printf '%s\n' "$pr_num"
 }
 
 ref_has_open_pr() {
     local refname="$1"
-    local owner branch remote pr_num
+    local owner branch remote repo pr_num
 
     case "$refname" in
         refs/heads/*)
             ensure_current_repo_owner || return 1
             owner="$_repo_owner"
+            repo="$_repo_full_name"
             branch="${refname#refs/heads/}"
             ;;
         refs/remotes/*)
@@ -285,8 +341,9 @@ ref_has_open_pr() {
             branch="${remote#*/}"
             remote="${remote%%/*}"
             [[ "$branch" == "HEAD" ]] && return 1
-            owner="$(git remote get-url --push "$remote" 2>/dev/null || git remote get-url "$remote" 2>/dev/null)" || return 1
-            owner="$(owner_from_url "$owner")" || return 1
+            repo="$(git remote get-url --push "$remote" 2>/dev/null || git remote get-url "$remote" 2>/dev/null)" || return 1
+            repo="$(repo_full_name_from_url "$repo")" || return 1
+            owner="${repo%%/*}"
             ;;
         *)
             return 1
@@ -296,8 +353,38 @@ ref_has_open_pr() {
     if "$debug"; then
         printf 'DEBUG candidate ref=%s owner=%s branch=%s\n' "$refname" "$owner" "$branch" >&2
     fi
-    pr_num="$(find_open_pr_number "$owner" "$branch")"
+    pr_num="$(find_open_pr_number "$owner" "$branch" "$repo")"
     [[ -n "$pr_num" ]]
+}
+
+base_ref_for_branch() {
+    local base_branch="$1" preferred_remote="${2:-}"
+    local candidate ref found=""
+
+    if [[ -n "$preferred_remote" ]]; then
+        candidate="${preferred_remote}/${base_branch}"
+        if git rev-parse --verify --quiet "$candidate^{commit}" >/dev/null; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    fi
+
+    candidate="origin/${base_branch}"
+    if git rev-parse --verify --quiet "$candidate^{commit}" >/dev/null; then
+        printf '%s\n' "$candidate"
+        return 0
+    fi
+
+    while read -r ref; do
+        [[ -n "$ref" ]] || continue
+        if [[ -n "$found" && "$found" != "$ref" ]]; then
+            return 1
+        fi
+        found="$ref"
+    done < <(git for-each-ref --format='%(refname:short)' "refs/remotes/*/${base_branch}")
+
+    [[ -n "$found" ]] || return 1
+    printf '%s\n' "$found"
 }
 
 top_range_base_ref() {
@@ -311,15 +398,9 @@ top_range_base_ref() {
     if [[ -n "$remote_ref" && "$remote_ref" == refs/remotes/* ]]; then
         remote="${remote_ref#refs/remotes/}"
         remote="${remote%%/*}"
-        candidate="${remote}/${base_branch}"
-        if git rev-parse --verify --quiet "$candidate^{commit}" >/dev/null; then
-            printf '%s\n' "$candidate"
-            return 0
-        fi
     fi
-
-    candidate="origin/${base_branch}"
-    if git rev-parse --verify --quiet "$candidate^{commit}" >/dev/null; then
+    candidate="$(base_ref_for_branch "$base_branch" "$remote" 2>/dev/null || true)"
+    if [[ -n "$candidate" ]]; then
         printf '%s\n' "$candidate"
         return 0
     fi
@@ -364,7 +445,7 @@ explicit_top_base_commit() {
     )"
     [[ -n "$base_pr" ]] || return 1
 
-    base_head="$(run_gh pr view "$base_pr" --json headRefOid,commits --jq '[.headRefOid // empty, (.commits | length)] | @tsv')" \
+    base_head="$(view_resolved_pr "$base_pr" --json headRefOid,commits --jq '[.headRefOid // empty, (.commits | length)] | @tsv')" \
         || die "Failed to read base PR #$base_pr"
     base_count="${base_head#*$'\t'}"
     base_head="${base_head%%$'\t'*}"
@@ -385,10 +466,16 @@ explicit_top_base_commit() {
     die "Base PR #$base_pr head $_explicit_top_base is not an ancestor of HEAD"
 }
 
+# Extract GitHub owner/repository from a remote URL.
+repo_full_name_from_url() {
+    local url="$1"
+    printf '%s\n' "$url" | sed -E 's#^[^:]+://[^/]+/##; s#^[^@]+@[^:]+:##; s#\.git$##'
+}
+
 # Extract GitHub owner from a remote URL.
 owner_from_url() {
     local url="$1"
-    printf '%s\n' "$url" | sed -E 's#^[^:]+://[^/]+/##; s#^[^@]+@[^:]+:##; s#^([^/]+)/.*#\1#'
+    repo_full_name_from_url "$url" | sed -E 's#^([^/]+)/.*#\1#'
 }
 
 # ---------------------------------------------------------------------------
@@ -630,10 +717,11 @@ if "$since_ack"; then
 
     url="$(git remote get-url "$tracking_remote" 2>/dev/null)" || die "Failed to get URL for remote $tracking_remote"
     owner="$(owner_from_url "$url")" || die "Failed to parse owner from remote URL"
+    repo="$(repo_full_name_from_url "$url")" || die "Failed to parse repository from remote URL"
 
-    resolve_pr "$owner" "$tracking_branch"
+    resolve_pr "$owner" "$tracking_branch" "$repo"
 
-    pr_json="$(gh pr view "$pr_number" --json comments,reviews,commits,headRefOid,headRefName,headRepositoryOwner)" \
+    pr_json="$(view_resolved_pr "$pr_number" --json comments,reviews,commits,headRefOid,headRefName,headRepositoryOwner)" \
         || die "Failed to read PR metadata"
 
     # Verify local HEAD matches PR head
@@ -733,10 +821,11 @@ else
     url="$(git remote get-url --push "$push_remote" 2>/dev/null || git remote get-url "$push_remote")" \
         || die "Failed to get URL for remote $push_remote"
     owner="$(owner_from_url "$url")" || die "Failed to parse owner from remote URL"
+    repo="$(repo_full_name_from_url "$url")" || die "Failed to parse repository from remote URL"
 
-    resolve_pr "$owner" "$push_branch"
+    resolve_pr "$owner" "$push_branch" "$repo"
 
-    pr_view="$(gh pr view "$pr_number" --json commits,baseRefName)" \
+    pr_view="$(view_resolved_pr "$pr_number" --json commits,baseRefName)" \
         || die "Failed to read PR metadata"
 
     if "$top_only"; then
@@ -753,7 +842,9 @@ else
     else
         n_remote="$(printf '%s\n' "$pr_view" | jq -r '.commits | length')"
         base_branch="$(printf '%s\n' "$pr_view" | jq -r '.baseRefName')"
-        n_local="$(git rev-list --count "origin/${base_branch}..HEAD")"
+        base_ref="$(base_ref_for_branch "$base_branch" "$push_remote" 2>/dev/null || true)"
+        [[ -n "$base_ref" ]] || die "Could not find local ref for base branch $base_branch"
+        n_local="$(git rev-list --count "${base_ref}..HEAD")"
 
         git range-diff "${prev}~${n_remote}..${prev}" "HEAD~${n_local}..HEAD" --creation-factor=95 "${range_diff_args[@]}"
     fi

@@ -47,7 +47,7 @@ BUILD_DIR=build-tidy-debug ~/utils/tidy-btc-mac.zsh
 
 Range-diff local commits against the remote version of a PR.
 
-Default mode compares local HEAD against the pushed remote ref (`@{push}`), useful for reviewing your own changes before pushing. `--since-ack` mode finds your last ACK/utACK comment on the PR and range-diffs from that commit, useful when re-reviewing a PR after a force-push. `--top` narrows the comparison to commits above an inferred stacked base branch. Handles detached HEAD automatically.
+Default mode compares local HEAD against the pushed remote ref (`@{push}`), useful for reviewing your own changes before pushing. PR discovery first uses the current `gh` repository context and then falls back to the pushed remote's `owner/repo`, so PRs opened against your own fork are handled too. Base branches are resolved from the pushed remote before falling back to `origin`. `--since-ack` mode finds your last ACK/utACK comment on the PR and range-diffs from that commit, useful when re-reviewing a PR after a force-push. `--top` narrows the comparison to commits above an inferred stacked base branch. Handles detached HEAD automatically.
 
 Install by symlinking the script and man page:
 

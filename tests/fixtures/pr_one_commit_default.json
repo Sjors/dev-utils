@@ -1,0 +1,9 @@
+{
+  "commits": [
+    {"oid": "%%HEAD_SHA%%"}
+  ],
+  "baseRefName": "2026/04/hwi-rs",
+  "headRefOid": "%%HEAD_SHA%%",
+  "headRefName": "2026/04/musig",
+  "headRepositoryOwner": {"login": "Sjors"}
+}
