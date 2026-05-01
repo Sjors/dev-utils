@@ -285,6 +285,41 @@ make_rebased_merge_pr() {
     [[ "$output" == *"new PR version"* ]]
 }
 
+@test "default mode: uses origin base for fork-to-upstream PR" {
+    git remote add origin "https://github.com/bitcoin/bitcoin.git"
+    git remote add sjors "git@github.com:Sjors/bitcoin.git"
+    git update-ref refs/remotes/sjors/master "$BASE_SHA"
+
+    echo "upstream 1" > upstream.txt && git add upstream.txt
+    git commit -q -m "upstream commit 1"
+    echo "upstream 2" >> upstream.txt && git add upstream.txt
+    git commit -q -m "upstream commit 2"
+    git update-ref refs/remotes/origin/master HEAD
+
+    git checkout -q -b fork-feature
+    echo "old pr work" > pr.txt && git add pr.txt
+    git commit -q -m "old PR version"
+    git update-ref refs/remotes/sjors/fork-feature HEAD
+    git branch --set-upstream-to=sjors/fork-feature fork-feature >/dev/null
+
+    git reset -q --hard origin/master
+    echo "new pr work" > pr.txt && git add pr.txt
+    git commit -q -m "new PR version"
+    export PR_SHA
+    PR_SHA="$(git rev-parse HEAD)"
+
+    export MOCK_OPEN_BRANCHES="fork-feature"
+    export MOCK_PR_JSON="$FIXTURES/pr_one_commit_master.json"
+    export MOCK_HEAD_SHA="$PR_SHA"
+
+    run "$SCRIPT" 2>&1
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"old PR version"* ]]
+    [[ "$output" == *"new PR version"* ]]
+    [[ "$output" != *"upstream commit 1"* ]]
+    [[ "$output" != *"upstream commit 2"* ]]
+}
+
 @test "--since-ack: ACK comment with SHA runs range-diff" {
     # Create old version of the PR commit (the one that was ACK'd)
     echo "old pr work" > pr.txt && git add pr.txt

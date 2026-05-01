@@ -54,8 +54,8 @@ using git-range-diff(1).
 In the default mode the "old" side is the pushed remote ref (@{push}) and the
 "new" side is local HEAD. Useful for reviewing local changes before pushing.
 PR discovery first uses the current gh repository context and then falls back
-to the pushed remote's owner/repo. Base branches are resolved from the pushed
-remote before falling back to origin.
+to the pushed remote's owner/repo. Base branches are resolved from the PR
+repository before falling back to origin.
 
 With --since-ack the "old" side is the commit you last ACK'd (or utACK'd) in a
 PR comment. Useful when re-reviewing a PR after a force-push.
@@ -387,19 +387,41 @@ base_ref_for_branch() {
     printf '%s\n' "$found"
 }
 
+remote_for_repo() {
+    local wanted_repo="$1"
+    local remote url repo
+
+    wanted_repo="$(lower "$wanted_repo")"
+    while read -r remote; do
+        [[ -n "$remote" ]] || continue
+        url="$(git remote get-url --push "$remote" 2>/dev/null || git remote get-url "$remote" 2>/dev/null)" || continue
+        repo="$(repo_full_name_from_url "$url")" || continue
+        if [[ "$(lower "$repo")" == "$wanted_repo" ]]; then
+            printf '%s\n' "$remote"
+            return 0
+        fi
+    done < <(git remote)
+
+    return 1
+}
+
+base_remote_for_resolved_pr() {
+    if [[ -n "${pr_repo:-}" ]]; then
+        remote_for_repo "$pr_repo"
+        return $?
+    fi
+    return 1
+}
+
 top_range_base_ref() {
-    local base_branch="" remote_ref remote candidate
+    local base_branch="" base_remote="" candidate
 
     load_current_pr_json || return 1
     base_branch="$(printf '%s\n' "$_current_pr_json" | jq -r '.baseRefName // empty')"
     [[ -n "$base_branch" ]] || return 1
 
-    remote_ref="$(git rev-parse --symbolic-full-name @{push} 2>/dev/null || true)"
-    if [[ -n "$remote_ref" && "$remote_ref" == refs/remotes/* ]]; then
-        remote="${remote_ref#refs/remotes/}"
-        remote="${remote%%/*}"
-    fi
-    candidate="$(base_ref_for_branch "$base_branch" "$remote" 2>/dev/null || true)"
+    base_remote="$(base_remote_for_resolved_pr 2>/dev/null || true)"
+    candidate="$(base_ref_for_branch "$base_branch" "$base_remote" 2>/dev/null || true)"
     if [[ -n "$candidate" ]]; then
         printf '%s\n' "$candidate"
         return 0
@@ -842,7 +864,8 @@ else
     else
         n_remote="$(printf '%s\n' "$pr_view" | jq -r '.commits | length')"
         base_branch="$(printf '%s\n' "$pr_view" | jq -r '.baseRefName')"
-        base_ref="$(base_ref_for_branch "$base_branch" "$push_remote" 2>/dev/null || true)"
+        base_remote="$(base_remote_for_resolved_pr 2>/dev/null || true)"
+        base_ref="$(base_ref_for_branch "$base_branch" "$base_remote" 2>/dev/null || true)"
         [[ -n "$base_ref" ]] || die "Could not find local ref for base branch $base_branch"
         n_local="$(git rev-list --count "${base_ref}..HEAD")"
 

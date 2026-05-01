@@ -1,0 +1,9 @@
+{
+  "commits": [
+    {"oid": "%%HEAD_SHA%%"}
+  ],
+  "baseRefName": "master",
+  "headRefOid": "%%HEAD_SHA%%",
+  "headRefName": "fork-feature",
+  "headRepositoryOwner": {"login": "Sjors"}
+}
