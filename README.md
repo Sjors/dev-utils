@@ -98,6 +98,44 @@ cd ~/utils
 ~/utils/guix-try --help     # all options and environment variables
 ```
 
+## `verify_bitcoin_commits.sh`
+
+Verify each commit in a Bitcoin Core range by checking it out, building, and
+running selected unit and functional tests. By default it writes the full
+terminal transcript to `tmp/verify-bitcoin-commits.log` in the Bitcoin Core
+checkout, while still printing output to the terminal.
+
+```sh
+cd ~/src/bitcoin
+~/utils/verify_bitcoin_commits.sh -r 5 -u descriptor_tests
+~/utils/verify_bitcoin_commits.sh -r a1b2c3..HEAD \
+  -u "miner_tests,txvalidation_tests" \
+  -f "interface_ipc.py,interface_ipc_mining.py"
+```
+
+Useful options:
+
+- pass `--log-file <path>` to choose a different log file
+- pass `--no-log` to disable writing the log
+- pass `--tmp-root <dir>` to move temp output and the default log location
+
+## `bitcoin-test-temp-root.sh`
+
+Print a temp root for Bitcoin Core test runs. On macOS it prefers
+`/Volumes/RAMDisk`, creating the standard 11 GiB RAM disk when enough memory is
+available. If the RAM disk is unavailable or memory is tight, it falls back to
+`${TMPDIR:-/tmp}/bitcoin-tests`.
+
+```sh
+test_tmp_root=$(~/utils/bitcoin-test-temp-root.sh)
+build/test/functional/test_runner.py --tmpdirprefix="$test_tmp_root"
+
+~/utils/bitcoin-test-temp-root.sh --preserve
+```
+
+By default the selected temp root is cleared before use. Pass `--preserve` or
+`--no-clear` to reuse existing temp contents.
+
 ## Tests
 
 ```sh
