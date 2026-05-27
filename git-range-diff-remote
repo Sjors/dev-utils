@@ -61,7 +61,9 @@ With --since-ack the "old" side is the commit you last ACK'd (or utACK'd) in a
 PR comment. Useful when re-reviewing a PR after a force-push.
 
 With --since HASH the "old" side is the specified commit. Like --since-ack but
-without the GitHub lookup — useful when you know the commit hash already.
+without the GitHub lookup — useful when you know the commit hash already. When
+possible, the "new" side is anchored at the nearest merged mainline base ref
+instead of being estimated from the old commit count.
 
 With --top, only compare commits that are on top of a stacked base branch. The
 base is inferred as the nearest ancestor of HEAD that is also the tip of
@@ -607,9 +609,20 @@ run_from_prev() {
         fi
     fi
 
-    # Use HEAD~n..HEAD for the new range to exclude any base-branch commits
-    # that were incorporated when the PR was rebased. When n isn't provided
-    # (--since mode), estimate it from the old range.
+    # Prefer a current mainline base ref for the new range. This excludes base
+    # merge commits and their side-parent payloads, which HEAD~n..HEAD can
+    # accidentally include when the old and new PR widths differ.
+    local current_base_ref
+    current_base_ref="$(nearest_mainline_base_ref 2>/dev/null || true)"
+    if [[ -n "$current_base_ref" ]]; then
+        printf 'Using PREV=%s BASE=%s\n' "$prev" "$current_base_ref" >&2
+        git range-diff "$mb...$prev" "${current_base_ref}..HEAD" "${range_diff_args[@]}"
+        return 0
+    fi
+
+    # Use HEAD~n..HEAD for the new range when no local mainline base ref is
+    # available. When n isn't provided (--since mode), estimate it from the old
+    # range.
     [[ -n "$n" ]] || n="$(git rev-list --count "$mb..$prev")"
 
     printf 'Using PREV=%s N=%s\n' "$prev" "$n" >&2
@@ -625,6 +638,30 @@ is_mainline_ref() {
             ;;
     esac
     return 1
+}
+
+nearest_mainline_base_ref() {
+    local head refname commit distance best_ref="" best_distance=-1
+
+    head="$(git rev-parse HEAD)"
+    while read -r refname commit; do
+        [[ -n "$refname" && -n "$commit" ]] || continue
+        [[ "$refname" == "refs/remotes/"*"/HEAD" ]] && continue
+        is_mainline_ref "$refname" || continue
+        [[ "$commit" == "$head" ]] && continue
+
+        distance="$(git rev-list --count "${commit}..HEAD")" || continue
+        [[ "$distance" =~ ^[0-9]+$ ]] || continue
+        (( distance > 0 )) || continue
+
+        if (( best_distance < 0 || distance < best_distance )); then
+            best_distance="$distance"
+            best_ref="$refname"
+        fi
+    done < <(git for-each-ref --format='%(refname) %(objectname)' --merged HEAD refs/heads refs/remotes)
+
+    [[ -n "$best_ref" ]] || return 1
+    git rev-parse --abbrev-ref "$best_ref"
 }
 
 infer_top_base_commit() {

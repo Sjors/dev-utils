@@ -214,6 +214,40 @@ make_rebased_merge_pr() {
     [[ "$output" == *"Using PREV=$SINCE_SHA N=1"* ]]
 }
 
+@test "--since: uses current mainline base instead of including base merge payload" {
+    git remote add w0xlt "https://github.com/w0xlt/bitcoin.git"
+    git remote add sjors "https://github.com/sjors/bitcoin.git"
+
+    git checkout -q -b upstream-doc "$BASE_SHA"
+    echo "unrelated doc" > doc.txt && git add doc.txt
+    git commit -q -m "unrelated doc"
+
+    git checkout -q master
+    git merge --no-ff -q -m "merge upstream doc" upstream-doc
+    git update-ref refs/remotes/sjors/master HEAD
+
+    git checkout -q --detach "$BASE_SHA"
+    echo "old pr work 1" > pr.txt && git add pr.txt
+    git commit -q -m "old PR version 1"
+    echo "old pr work 2" >> pr.txt && git add pr.txt
+    git commit -q -m "old PR version 2"
+    export SINCE_SHA
+    SINCE_SHA="$(git rev-parse HEAD)"
+
+    git checkout -q --detach refs/remotes/sjors/master
+    echo "new pr work" > pr.txt && git add pr.txt
+    git commit -q -m "new PR version"
+    git update-ref refs/remotes/w0xlt/ipc-submit-block HEAD
+    git checkout -q --detach HEAD
+
+    run "$SCRIPT" --since "$SINCE_SHA" 2>&1
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Using PREV=$SINCE_SHA BASE="* ]]
+    [[ "$output" == *"new PR version"* ]]
+    [[ "$output" != *"unrelated doc"* ]]
+    [[ "$output" != *"merge upstream doc"* ]]
+}
+
 @test "--since: dies with clear message when commit is ancestor of HEAD" {
     make_pr_head
 

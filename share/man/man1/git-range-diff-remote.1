@@ -19,7 +19,9 @@ With \fB\-\-since\-ack\fR the "old" side is the commit you last ACK'd (or utACK'
 PR comment. Useful when re\-reviewing a PR after a force\-push.
 .PP
 With \fB\-\-since\fR HASH the "old" side is the specified commit. Like \fB\-\-since\-ack\fR but
-without the GitHub lookup ??? useful when you know the commit hash already.
+without the GitHub lookup ??? useful when you know the commit hash already. When
+possible, the "new" side is anchored at the nearest merged mainline base ref
+instead of being estimated from the old commit count.
 .PP
 With \fB\-\-top\fR, only compare commits that are on top of a stacked base branch. The
 base is inferred as the nearest ancestor of HEAD that is also the tip of

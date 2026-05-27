@@ -55,9 +55,12 @@ the current `gh` repository context and then falls back to the pushed remote's
 `owner/repo`, so PRs opened against your own fork are handled too. Base
 branches are resolved from the PR repository before falling back to `origin`.
 `--since-ack` mode finds your last ACK/utACK comment on the PR and range-diffs
-from that commit, useful when re-reviewing a PR after a force-push. `--top`
-narrows the comparison to commits above an inferred stacked base branch.
-Handles detached HEAD automatically.
+from that commit, useful when re-reviewing a PR after a force-push. The
+`--since HASH` mode does the same from a caller-specified commit and, when
+possible, anchors the current side at the nearest merged mainline base ref
+instead of estimating it from the old commit count. `--top` narrows the
+comparison to commits above an inferred stacked base branch. Handles detached
+HEAD automatically.
 
 Install by symlinking the script and man page:
 
