@@ -52,8 +52,10 @@ Range-diff local commits against the remote version of a PR.
 Default mode compares local HEAD against the pushed remote ref (`@{push}`),
 useful for reviewing your own changes before pushing. PR discovery first uses
 the current `gh` repository context and then falls back to the pushed remote's
-`owner/repo`, so PRs opened against your own fork are handled too. Base
-branches are resolved from the PR repository before falling back to `origin`.
+`owner/repo`, so PRs opened against your own fork are handled too. The current
+repository lookup matches the exact head branch, which also handles
+upstream-owned branches reviewed from a fork checkout. Base branches are
+resolved from the PR repository before falling back to `origin`.
 `--since-ack` mode finds your last ACK/utACK comment on the PR and range-diffs
 from that commit, useful when re-reviewing a PR after a force-push. The
 `--since HASH` mode does the same from a caller-specified commit and, when

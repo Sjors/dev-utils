@@ -9,6 +9,7 @@
 #   MOCK_BASE_COUNT  commit count returned for MOCK_BASE_PR
 #   MOCK_OPEN_BRANCHES space-separated branch names treated as open PRs
 #   MOCK_PR_REPO     owner/repo that must be passed via --repo for PR lookups
+#   MOCK_LIST_REQUIRE_BRANCH_ONLY make owner-scoped pr list calls return no PRs
 
 args="$*"
 
@@ -38,6 +39,10 @@ elif [[ "$args" == *"pr list"* ]]; then
         if [[ -n "$branch" ]]; then
             for open_branch in ${MOCK_OPEN_BRANCHES}; do
                 if [[ "$open_branch" == "$branch" ]]; then
+                    if [[ -n "${MOCK_LIST_REQUIRE_BRANCH_ONLY:-}" && "$args" == *"headRepositoryOwner"* ]]; then
+                        printf '\n'
+                        exit 0
+                    fi
                     printf '%s\n' "${MOCK_PR_NUMBER:-42}"
                     exit 0
                 fi

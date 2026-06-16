@@ -31,6 +31,7 @@ setup() {
     unset MOCK_PR_NUMBERS MOCK_PR_JSON MOCK_BASE_PR MOCK_BASE_HEAD MOCK_OPEN_BRANCHES
     unset MOCK_PR_REPO
     unset MOCK_HEAD_SHA MOCK_ACK_SHA MOCK_VIEW_PR_NUMBER MOCK_VIEW_HEAD_REF_NAME MOCK_VIEW_HEAD_REPO_OWNER
+    unset MOCK_LIST_REQUIRE_BRANCH_ONLY
 }
 
 # Helper: create a PR commit on a detached HEAD with a single remote-tracking ref.
@@ -352,6 +353,34 @@ make_rebased_merge_pr() {
     [[ "$output" == *"new PR version"* ]]
     [[ "$output" != *"upstream commit 1"* ]]
     [[ "$output" != *"upstream commit 2"* ]]
+}
+
+@test "default mode: current repo branch lookup can differ from push remote owner" {
+    git remote add origin "https://github.com/stratum-mining/sv2-tp.git"
+    git remote add sjors "git@github.com:Sjors/sv2-tp.git"
+    git update-ref refs/remotes/origin/master "$BASE_SHA"
+
+    git checkout -q -b 2025/08/witness_reserved_value
+    echo "old pr work" > pr.txt && git add pr.txt
+    git commit -q -m "old PR version"
+    git update-ref refs/remotes/sjors/2025/08/witness_reserved_value HEAD
+    git branch --set-upstream-to=sjors/2025/08/witness_reserved_value 2025/08/witness_reserved_value >/dev/null
+
+    git reset -q --hard "$BASE_SHA"
+    echo "new pr work" > pr.txt && git add pr.txt
+    git commit -q -m "new PR version"
+    export PR_SHA
+    PR_SHA="$(git rev-parse HEAD)"
+
+    export MOCK_OPEN_BRANCHES="2025/08/witness_reserved_value"
+    export MOCK_LIST_REQUIRE_BRANCH_ONLY=1
+    export MOCK_PR_JSON="$FIXTURES/pr_one_commit_master.json"
+    export MOCK_HEAD_SHA="$PR_SHA"
+
+    run "$SCRIPT" 2>&1
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"old PR version"* ]]
+    [[ "$output" == *"new PR version"* ]]
 }
 
 @test "--since-ack: ACK comment with SHA runs range-diff" {
