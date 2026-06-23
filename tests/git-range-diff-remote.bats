@@ -397,6 +397,84 @@ make_rebased_merge_pr() {
     [[ "$output" != *"upstream commit 2"* ]]
 }
 
+@test "default mode: uses closest base branch when PR repo base is stale" {
+    git remote add origin "https://github.com/bitcoin/bitcoin.git"
+    git remote add sjors "git@github.com:Sjors/bitcoin.git"
+    git update-ref refs/remotes/sjors/master "$BASE_SHA"
+
+    echo "upstream 1" > upstream.txt && git add upstream.txt
+    git commit -q -m "upstream commit 1"
+    echo "upstream 2" >> upstream.txt && git add upstream.txt
+    git commit -q -m "upstream commit 2"
+    git update-ref refs/remotes/origin/master HEAD
+
+    git checkout -q -b fork-feature refs/remotes/sjors/master
+    echo "old pr work" > pr.txt && git add pr.txt
+    git commit -q -m "old PR version"
+    git update-ref refs/remotes/sjors/fork-feature HEAD
+    git branch --set-upstream-to=sjors/fork-feature fork-feature >/dev/null
+
+    git reset -q --hard origin/master
+    echo "new pr work" > pr.txt && git add pr.txt
+    git commit -q -m "new PR version"
+    export PR_SHA
+    PR_SHA="$(git rev-parse HEAD)"
+
+    export MOCK_PR_REPO="Sjors/bitcoin"
+    export MOCK_OPEN_BRANCHES="fork-feature"
+    export MOCK_PR_JSON="$FIXTURES/pr_one_commit_master.json"
+    export MOCK_HEAD_SHA="$PR_SHA"
+    export MOCK_VIEW_HEAD_REF_NAME="fork-feature"
+    export MOCK_VIEW_HEAD_REPO_OWNER="Sjors"
+
+    run "$SCRIPT" 2>&1
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Warning: sjors/master leaves 3 local commits above HEAD; using closer base origin/master with 1 commits"* ]]
+    [[ "$output" == *"old PR version"* ]]
+    [[ "$output" == *"new PR version"* ]]
+    [[ "$output" != *"upstream commit 1"* ]]
+    [[ "$output" != *"upstream commit 2"* ]]
+}
+
+@test "default mode: leading merge commits do not overrun the old base" {
+    git remote add origin "https://github.com/bitcoin/bitcoin.git"
+    git remote add sjors "git@github.com:Sjors/bitcoin.git"
+
+    echo "current mainline" > mainline.txt && git add mainline.txt
+    git commit -q -m "current mainline base"
+    git update-ref refs/remotes/origin/master HEAD
+
+    git checkout -q -b stacked-base origin/master
+    echo "base side 1" > side.txt && git add side.txt
+    git commit -q -m "base side 1"
+    echo "base side 2" >> side.txt && git add side.txt
+    git commit -q -m "base side 2"
+
+    git checkout -q -b merge-feature origin/master
+    git merge --no-ff -q -m "merge stacked base" stacked-base
+    echo "old pr work" > pr.txt && git add pr.txt
+    git commit -q -m "old PR version"
+    git update-ref refs/remotes/sjors/merge-feature HEAD
+    git branch --set-upstream-to=sjors/merge-feature merge-feature >/dev/null
+
+    git reset -q --hard origin/master
+    git merge --no-ff -q -m "merge stacked base" stacked-base
+    echo "new pr work" > pr.txt && git add pr.txt
+    git commit -q -m "new PR version"
+    export PR_SHA
+    PR_SHA="$(git rev-parse HEAD)"
+
+    export MOCK_OPEN_BRANCHES="merge-feature"
+    export MOCK_PR_JSON="$FIXTURES/pr_default.json"
+    export MOCK_HEAD_SHA="$PR_SHA"
+
+    run "$SCRIPT" 2>&1
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"old PR version"* ]]
+    [[ "$output" == *"new PR version"* ]]
+    [[ "$output" != *"current mainline base"* ]]
+}
+
 @test "default mode: current repo branch lookup can differ from push remote owner" {
     git remote add origin "https://github.com/stratum-mining/sv2-tp.git"
     git remote add sjors "git@github.com:Sjors/sv2-tp.git"

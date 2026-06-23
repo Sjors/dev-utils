@@ -56,8 +56,9 @@ In the default mode the "old" side is the pushed remote ref (@{push}) and the
 PR discovery first uses the current gh repository context and then falls back
 to the pushed remote's owner/repo. The current repository lookup matches the
 exact head branch, which also handles upstream-owned branches reviewed from a
-fork checkout. Base branches are resolved from the PR repository before falling
-back to origin.
+fork checkout. Base branch refs are chosen by the smallest local commit count
+above a matching branch name, with a warning if the PR repository's base ref
+appears stale.
 
 With --since-ack the "old" side is the commit you last ACK'd (or utACK'd) in a
 PR comment. Useful when re-reviewing a PR after a force-push.
@@ -391,19 +392,49 @@ ref_has_open_pr() {
 
 base_ref_for_branch() {
     local base_branch="$1" preferred_remote="${2:-}"
-    local candidate ref found=""
+    local candidate ref found="" best_ref="" best_count=-1 count
+    local preferred_ref="" preferred_count=""
+    local -a candidates=()
 
     if [[ -n "$preferred_remote" ]]; then
         candidate="${preferred_remote}/${base_branch}"
         if git rev-parse --verify --quiet "$candidate^{commit}" >/dev/null; then
-            printf '%s\n' "$candidate"
-            return 0
+            preferred_ref="$candidate"
+            candidates+=("$candidate")
         fi
     fi
 
     candidate="origin/${base_branch}"
     if git rev-parse --verify --quiet "$candidate^{commit}" >/dev/null; then
-        printf '%s\n' "$candidate"
+        candidates+=("$candidate")
+    fi
+
+    while read -r ref; do
+        [[ -n "$ref" ]] || continue
+        candidates+=("$ref")
+    done < <(git for-each-ref --format='%(refname:short)' "refs/remotes/*/${base_branch}")
+
+    while read -r ref; do
+        [[ -n "$ref" ]] || continue
+        count="$(git rev-list --count "${ref}..HEAD" 2>/dev/null)" || continue
+        [[ "$count" =~ ^[0-9]+$ ]] || continue
+        (( count > 0 )) || continue
+        if [[ -n "$preferred_ref" && "$ref" == "$preferred_ref" ]]; then
+            preferred_count="$count"
+        fi
+        if (( best_count < 0 || count < best_count )); then
+            best_count="$count"
+            best_ref="$ref"
+        fi
+    done < <(printf '%s\n' "${candidates[@]}" | sed '/^$/d' | sort -u)
+
+    if [[ -n "$best_ref" ]]; then
+        if [[ -n "$preferred_ref" && "$best_ref" != "$preferred_ref" && "$preferred_count" =~ ^[0-9]+$ && "$best_count" =~ ^[0-9]+$ ]] \
+            && (( preferred_count > best_count )); then
+            printf 'Warning: %s leaves %s local commits above HEAD; using closer base %s with %s commits. Fetch/update %s if this is unexpected.\n' \
+                "$preferred_ref" "$preferred_count" "$best_ref" "$best_count" "$preferred_ref" >&2
+        fi
+        printf '%s\n' "$best_ref"
         return 0
     fi
 
@@ -413,7 +444,7 @@ base_ref_for_branch() {
             return 1
         fi
         found="$ref"
-    done < <(git for-each-ref --format='%(refname:short)' "refs/remotes/*/${base_branch}")
+    done < <(printf '%s\n' "${candidates[@]}" | sed '/^$/d' | sort -u)
 
     [[ -n "$found" ]] || return 1
     printf '%s\n' "$found"
@@ -453,7 +484,7 @@ top_range_base_ref() {
     [[ -n "$base_branch" ]] || return 1
 
     base_remote="$(base_remote_for_resolved_pr 2>/dev/null || true)"
-    candidate="$(base_ref_for_branch "$base_branch" "$base_remote" 2>/dev/null || true)"
+    candidate="$(base_ref_for_branch "$base_branch" "$base_remote" || true)"
     if [[ -n "$candidate" ]]; then
         printf '%s\n' "$candidate"
         return 0
@@ -966,7 +997,7 @@ else
 
     resolve_pr "$owner" "$push_branch" "$repo"
 
-    pr_view="$(view_resolved_pr "$pr_number" --json commits,baseRefName)" \
+    pr_view="$(view_resolved_pr "$pr_number" --json baseRefName)" \
         || die "Failed to read PR metadata"
 
     if "$top_only"; then
@@ -981,13 +1012,12 @@ else
             git range-diff "${remote_top_base}..${prev}" "${top_base}..HEAD" --creation-factor=95 "${range_diff_args[@]}"
         fi
     else
-        n_remote="$(printf '%s\n' "$pr_view" | jq -r '.commits | length')"
         base_branch="$(printf '%s\n' "$pr_view" | jq -r '.baseRefName')"
         base_remote="$(base_remote_for_resolved_pr 2>/dev/null || true)"
-        base_ref="$(base_ref_for_branch "$base_branch" "$base_remote" 2>/dev/null || true)"
+        base_ref="$(base_ref_for_branch "$base_branch" "$base_remote" || true)"
         [[ -n "$base_ref" ]] || die "Could not find local ref for base branch $base_branch"
-        n_local="$(git rev-list --count "${base_ref}..HEAD")"
+        remote_base="$(git merge-base "$prev" "$base_ref")" || die "Failed to compute remote base"
 
-        git range-diff "${prev}~${n_remote}..${prev}" "HEAD~${n_local}..HEAD" --creation-factor=95 "${range_diff_args[@]}"
+        git range-diff "${remote_base}..${prev}" "${base_ref}..HEAD" --creation-factor=95 "${range_diff_args[@]}"
     fi
 fi

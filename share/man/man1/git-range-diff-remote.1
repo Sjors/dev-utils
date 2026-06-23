@@ -14,8 +14,9 @@ In the default mode the "old" side is the pushed remote ref (@{push}) and the
 PR discovery first uses the current gh repository context and then falls back
 to the pushed remote's owner/repo. The current repository lookup matches the
 exact head branch, which also handles upstream\-owned branches reviewed from a
-fork checkout. Base branches are resolved from the PR repository before falling
-back to origin.
+fork checkout. Base branch refs are chosen by the smallest local commit count
+above a matching branch name, with a warning if the PR repository's base ref
+appears stale.
 .PP
 With \fB\-\-since\-ack\fR the "old" side is the commit you last ACK'd (or utACK'd) in a
 PR comment. Useful when re\-reviewing a PR after a force\-push.
