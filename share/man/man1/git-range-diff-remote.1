@@ -22,8 +22,9 @@ PR comment. Useful when re\-reviewing a PR after a force\-push.
 .PP
 With \fB\-\-since\fR HASH the "old" side is the specified commit. Like \fB\-\-since\-ack\fR but
 without the GitHub lookup ??? useful when you know the commit hash already. When
-possible, the "new" side is anchored at the nearest merged mainline base ref
-instead of being estimated from the old commit count.
+the old and new tips share a non\-mainline commit, the "new" side is anchored at
+that shared commit. Otherwise, when possible, it is anchored at the nearest
+mainline base instead of being estimated from the old commit count.
 .PP
 With \fB\-\-top\fR, only compare commits that are on top of a stacked base branch. The
 base is inferred as the nearest ancestor of HEAD that is also the tip of

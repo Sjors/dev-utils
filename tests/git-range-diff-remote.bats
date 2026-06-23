@@ -249,6 +249,48 @@ make_rebased_merge_pr() {
     [[ "$output" != *"merge upstream doc"* ]]
 }
 
+@test "--since: shared PR base avoids unrelated mainline refs" {
+    git remote add hebasto "https://github.com/hebasto/bitcoin.git"
+    git remote add w0xlt "https://github.com/w0xlt/bitcoin.git"
+
+    git checkout -q -b upstream-doc "$BASE_SHA"
+    echo "unrelated doc" > doc.txt && git add doc.txt
+    git commit -q -m "unrelated doc"
+
+    git checkout -q master
+    git merge --no-ff -q -m "merge unrelated doc" upstream-doc
+    git update-ref refs/remotes/hebasto/master HEAD
+
+    git checkout -q --detach HEAD
+    echo "shared pr work" > pr.txt && git add pr.txt
+    git commit -q -m "shared PR version"
+    export SHARED_SHA
+    SHARED_SHA="$(git rev-parse HEAD)"
+
+    echo "old pr work" >> pr.txt && git add pr.txt
+    git commit -q -m "old PR version"
+    export SINCE_SHA
+    SINCE_SHA="$(git rev-parse HEAD)"
+
+    git checkout -q --detach "$SHARED_SHA"
+    echo "new extra pr work" >> pr.txt && git add pr.txt
+    git commit -q -m "new extra PR version"
+    echo "new pr work" >> pr.txt && git add pr.txt
+    git commit -q -m "new PR version"
+    git update-ref refs/remotes/w0xlt/ipc-shared HEAD
+    git checkout -q --detach HEAD
+
+    run "$SCRIPT" --since "$SINCE_SHA" 2>&1
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Using PREV=$SINCE_SHA SHARED_BASE=$SHARED_SHA"* ]]
+    [[ "$output" == *"old PR version"* ]]
+    [[ "$output" == *"new extra PR version"* ]]
+    [[ "$output" == *"new PR version"* ]]
+    [[ "$output" != *"unrelated doc"* ]]
+    [[ "$output" != *"merge unrelated doc"* ]]
+    [[ "$output" != *"shared PR version"* ]]
+}
+
 @test "--since: dies with clear message when commit is ancestor of HEAD" {
     make_pr_head
 

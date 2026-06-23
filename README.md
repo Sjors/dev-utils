@@ -59,10 +59,11 @@ resolved from the PR repository before falling back to `origin`.
 `--since-ack` mode finds your last ACK/utACK comment on the PR and range-diffs
 from that commit, useful when re-reviewing a PR after a force-push. The
 `--since HASH` mode does the same from a caller-specified commit and, when
-possible, anchors the current side at the nearest merged mainline base ref
-instead of estimating it from the old commit count. `--top` narrows the
-comparison to commits above an inferred stacked base branch. Handles detached
-HEAD automatically.
+the old and new tips share a non-mainline commit, anchors the current side at
+that shared commit. Otherwise, when possible, it anchors the current side at
+the nearest mainline base instead of estimating it from the old commit count.
+`--top` narrows the comparison to commits above an inferred stacked base
+branch. Handles detached HEAD automatically.
 
 Install by symlinking the script and man page:
 

@@ -64,8 +64,9 @@ PR comment. Useful when re-reviewing a PR after a force-push.
 
 With --since HASH the "old" side is the specified commit. Like --since-ack but
 without the GitHub lookup — useful when you know the commit hash already. When
-possible, the "new" side is anchored at the nearest merged mainline base ref
-instead of being estimated from the old commit count.
+the old and new tips share a non-mainline commit, the "new" side is anchored at
+that shared commit. Otherwise, when possible, it is anchored at the nearest
+mainline base instead of being estimated from the old commit count.
 
 With --top, only compare commits that are on top of a stacked base branch. The
 base is inferred as the nearest ancestor of HEAD that is also the tip of
@@ -614,6 +615,16 @@ run_from_prev() {
         return 0
     fi
 
+    # If the old and new tips share a PR commit, compare only commits above
+    # that shared point. Anchoring at a mainline base here would re-list shared
+    # PR commits, and in repositories with many fork remotes it can also pick
+    # an unrelated stale */master ref.
+    if ! commit_reachable_from_mainline_ref "$mb"; then
+        printf 'Using PREV=%s SHARED_BASE=%s\n' "$prev" "$mb" >&2
+        git range-diff "$mb...$prev" "$mb..HEAD" "${range_diff_args[@]}"
+        return 0
+    fi
+
     # If both tips are 2-parent merge commits and the old side balloons far
     # beyond the current PR width, compare the merged payload side directly.
     # This handles subtree-style PR branches that were rebased backwards onto
@@ -673,6 +684,32 @@ nearest_mainline_base_ref() {
     local head refname commit distance best_ref="" best_distance=-1
 
     head="$(git rev-parse HEAD)"
+
+    while read -r refname commit; do
+        [[ -n "$refname" && -n "$commit" ]] || continue
+        [[ "$commit" == "$head" ]] && continue
+
+        local base
+        base="$(git merge-base HEAD "$commit")" || continue
+        [[ -n "$base" && "$base" != "$head" ]] || continue
+        distance="$(git rev-list --count "${base}..HEAD")" || continue
+        [[ "$distance" =~ ^[0-9]+$ ]] || continue
+        (( distance > 0 )) || continue
+
+        if (( best_distance < 0 || distance < best_distance )); then
+            best_distance="$distance"
+            best_ref="$base"
+        fi
+    done < <(git for-each-ref --format='%(refname) %(objectname)' refs/heads refs/remotes/origin | while read -r refname commit; do
+        is_mainline_ref "$refname" || continue
+        printf '%s %s\n' "$refname" "$commit"
+    done)
+
+    if [[ -n "$best_ref" ]]; then
+        printf '%s\n' "$best_ref"
+        return 0
+    fi
+
     while read -r refname commit; do
         [[ -n "$refname" && -n "$commit" ]] || continue
         [[ "$refname" == "refs/remotes/"*"/HEAD" ]] && continue
@@ -691,6 +728,19 @@ nearest_mainline_base_ref() {
 
     [[ -n "$best_ref" ]] || return 1
     git rev-parse --abbrev-ref "$best_ref"
+}
+
+commit_reachable_from_mainline_ref() {
+    local commit="$1" refname ref_commit
+
+    while read -r refname ref_commit; do
+        [[ -n "$refname" && -n "$ref_commit" ]] || continue
+        [[ "$refname" == "refs/remotes/"*"/HEAD" ]] && continue
+        is_mainline_ref "$refname" || continue
+        git merge-base --is-ancestor "$commit" "$ref_commit" && return 0
+    done < <(git for-each-ref --format='%(refname) %(objectname)' refs/heads refs/remotes)
+
+    return 1
 }
 
 infer_top_base_commit() {
