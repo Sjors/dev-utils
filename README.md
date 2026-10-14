@@ -83,6 +83,79 @@ git range-diff-remote --top             # only commits above the stacked base
 git range-diff-remote --help            # full usage (man page)
 ```
 
+## `git-fetch-sign`
+
+Fetch a topic branch from an explicitly selected Git remote, sign its commits
+with your local Git signing key, and replace the same local branch. Run from
+any worktree; the utility finds and updates the branch's own worktree. It preserves
+commit contents, metadata, dates, and merge topology, verifies every signature,
+and keeps recovery refs for the fetched and previous local tips. After a
+successful local sync, it pushes the signed branch back to that remote using a
+force-with-lease tied to the exact fetched tip. `--remote NAME` is required;
+the utility does not assume a source machine or remote name.
+Use `--no-push` to keep the signed result local.
+
+For SSH and local transports, the push uses Git's `updateInstead` mode for
+that invocation only. This updates a checked-out remote branch and its
+worktree together, including linked worktrees, without detaching the worktree
+or changing remote configuration. Dirty remote worktrees refuse the push,
+preserving their edits. A changed remote tip also refuses the push. In either
+case, the signed local branch and recovery refs remain available.
+
+Local staged, unstaged, and untracked changes are automatically stashed just
+before replacing the branch and restored afterward, including their staging
+state. Ignored files are excluded from the stash; existing stashes are preserved.
+If stash restoration conflicts, the utility reverts the sync and restores the
+original changes on the old branch tip, then exits with an error. If recovery
+also fails, it keeps the stash and prints a recovery ref. Unresolved conflicts
+and ongoing Git operations are refused. `--dry-run` leaves local changes in
+place without stashing them.
+
+```sh
+cd /path/to/repository
+git fetch-sign --remote workstation
+git fetch-sign --remote workstation --dry-run feature/example
+git fetch-sign --remote workstation feature/example
+git fetch-sign --remote workstation --pr 123 --repo owner/repo
+git fetch-sign --remote workstation \
+  --pr https://github.com/owner/repo/pull/123 \
+  --worktree ../repository-pr/123-topic
+git fetch-sign --remote workstation --base origin/parent-branch stacked-topic
+```
+
+With no branch argument or `--pr`, use the current worktree's branch.
+Detached HEAD requires an explicit branch name or `--pr NUMBER/URL`.
+`--pr` uses `gh` to query GitHub's API for the head branch name, then fetches
+it from the selected remote.
+PR numbers use the current `gh` repository context; `--repo owner/repo`
+selects a repository explicitly.
+
+The branch must have a local worktree. If it has none, supply `--worktree PATH`
+to create one after signing succeeds. The destination must not exist.
+`--dry-run` also requires this option for a missing worktree, but creates
+nothing. If the branch already has a worktree, an explicit path must match it.
+
+Each run fetches `master` from `origin` first, falling back to `main` only
+if the remote has no `master`. All commits reachable from that fetched tip
+keep their original IDs and signatures, including upstream commits merged into
+the topic branch. This works even with a stale `origin/HEAD` or a missing local
+upstream tracking ref. An upstream fetch failure stops the sync.
+
+`--upstream REMOTE/BRANCH` selects a different upstream. `--base REF` additionally
+excludes a stacked parent branch's history; it cannot disable upstream protection.
+`--remote` selects the source remote. A branch containing only upstream
+commits is synced without recreating them. Signing topic commits changes their
+IDs. The automatic push goes back to the selected source remote.
+
+From this repository, install the Git subcommand and its manual:
+
+```sh
+mkdir -p ~/bin ~/share/man/man1
+ln -s "$PWD/git-fetch-sign" ~/bin/git-fetch-sign
+ln -s "$PWD/share/man/man1/git-fetch-sign.1" ~/share/man/man1/git-fetch-sign.1
+git fetch-sign --help
+```
+
 ## `guix-try`
 
 Fetch a macOS guix build from a remote SSH host, extract it, ad hoc codesign it
@@ -148,4 +221,5 @@ By default the selected temp root is cleared before use. Pass `--preserve` or
 ```sh
 brew install bats-core
 bats tests/
+python3 -m unittest discover -s tests -p 'test_*.py'
 ```

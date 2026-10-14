@@ -1,0 +1,374 @@
+#!/usr/bin/env python3
+"""Fetch, sign, and sync a branch locally, then push it back to its source remote."""
+
+from __future__ import annotations
+
+import argparse
+from datetime import datetime, timezone
+import os
+from pathlib import Path
+import re
+import stat
+import subprocess
+import sys
+import uuid
+
+
+class Error(Exception):
+    pass
+
+
+def git(*args: str, cwd: str | None = None, data: bytes | None = None,
+        env: dict[str, str] | None = None, check: bool = True) -> bytes:
+    result = subprocess.run(
+        ["git", "--no-replace-objects", *args], cwd=cwd, input=data, env=env,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    if check and result.returncode:
+        raise Error(result.stderr.decode(errors="replace").strip())
+    return result.stdout
+
+
+def oid(ref: str, required: bool = True) -> str:
+    return git("rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}",
+               check=required).decode().strip()
+
+
+def fetch_upstream(spec: str | None) -> tuple[str, str]:
+    if spec is None:
+        # Inspect the actual remote, rather than trusting a potentially stale
+        # origin/HEAD or assuming that origin/master has already been fetched.
+        advertised = git("ls-remote", "--heads", "--", "origin",
+                         "refs/heads/master", "refs/heads/main").decode().splitlines()
+        branches = {line.split()[1] for line in advertised}
+        name = next((b for b in ("master", "main") if f"refs/heads/{b}" in branches), None)
+        if name is None:
+            raise Error("No master/main branch on origin; pass --upstream REMOTE/BRANCH")
+        spec = f"origin/{name}"
+    remote, separator, branch = spec.partition("/")
+    if not separator or not remote or not branch:
+        raise Error("--upstream must be REMOTE/BRANCH")
+    git("remote", "get-url", "--", remote)
+    git("check-ref-format", f"refs/heads/{branch}")
+    ref = f"refs/remotes/{remote}/{branch}"
+    git("fetch", "--no-tags", "--no-recurse-submodules", "--", remote,
+        f"+refs/heads/{branch}:{ref}")
+    tip = oid(ref)
+    print(f"Fetched upstream {spec}: {tip}", flush=True)
+    return ref, tip
+
+
+def pr_branch(pr: str, repo: str | None) -> str:
+    if not (re.fullmatch(r"[1-9]\d*", pr) or
+            re.fullmatch(r"https://[^/]+/[^/]+/[^/]+/pull/[1-9]\d*/?", pr)):
+        raise Error("--pr must be a PR number or a full pull request URL")
+    command = ["gh", "pr", "view", pr, "--json", "headRefName", "--jq", ".headRefName"]
+    if repo:
+        command.extend(["--repo", repo])
+    result = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if result.returncode:
+        raise Error(f"GitHub PR lookup failed: {result.stderr.strip()}")
+    branch = result.stdout.strip()
+    if not branch or branch == "null":
+        raise Error("GitHub PR lookup returned no head branch")
+    print(f"PR {pr}: branch {branch}", flush=True)
+    return branch
+
+
+def branch_worktree(ref: str) -> str | None:
+    for entry in git("worktree", "list", "--porcelain", "-z").split(b"\0\0"):
+        fields = entry.split(b"\0")
+        if os.fsencode(f"branch {ref}") in fields:
+            return os.fsdecode(fields[0].removeprefix(b"worktree "))
+    return None
+
+
+def worktree_dirty(path: str) -> bool:
+    return bool(git("status", "--porcelain", "--untracked-files=all", cwd=path))
+
+
+def check_worktree(path: str | None, ref: str, allow_dirty: bool = False) -> None:
+    if path is None:
+        return
+    if git("symbolic-ref", "--quiet", "HEAD", cwd=path).decode().strip() != ref:
+        raise Error(f"Branch checkout changed in {path}")
+    for state in ("rebase-merge", "rebase-apply", "MERGE_HEAD", "CHERRY_PICK_HEAD",
+                  "REVERT_HEAD", "sequencer", "BISECT_START"):
+        state_path = os.fsdecode(git("rev-parse", "--git-path", state, cwd=path).strip())
+        if (Path(path) / state_path).exists():
+            raise Error(f"Git operation in progress in {path}: {state}")
+    if git("ls-files", "--unmerged", "-z", cwd=path):
+        raise Error(f"Unresolved conflicts in branch worktree: {path}")
+    if not allow_dirty and worktree_dirty(path):
+        raise Error(f"Branch worktree is dirty: {path}")
+
+
+def drop_saved_stash(path: str, stash: str, recovery: str) -> None:
+    # Stashes are shared by linked worktrees. Locate ours by object ID rather
+    # than assuming it is still stash@{0}.
+    for line in git("stash", "list", "--format=%H %gd", cwd=path).decode().splitlines():
+        commit, selector = line.split(" ", 1)
+        if commit == stash:
+            git("stash", "drop", selector, cwd=path)
+            break
+    git("update-ref", "-d", recovery, stash)
+
+
+def remove_restored_untracked(path: str, stash: str) -> None:
+    untracked = oid(f"{stash}^3", required=False)
+    if not untracked:
+        return
+    # A failed stash application can already have restored some untracked
+    # files. Remove only those matching the saved files before applying again.
+    # Never run git clean, which could delete unrelated or ignored files.
+    for entry in git("ls-tree", "-r", "-z", untracked).split(b"\0"):
+        if not entry:
+            continue
+        metadata, name = entry.split(b"\t", 1)
+        mode, _, blob = metadata.split()
+        target = Path(path) / os.fsdecode(name)
+        if not os.path.lexists(target):
+            continue
+        saved = git("cat-file", "blob", blob.decode())
+        file_mode = target.lstat().st_mode
+        if mode == b"120000" and stat.S_ISLNK(file_mode):
+            matches = os.fsencode(os.readlink(target)) == saved
+        elif mode != b"120000" and stat.S_ISREG(file_mode):
+            matches = target.read_bytes() == saved
+        else:
+            matches = False
+        if not matches:
+            raise Error(f"Cannot safely remove changed untracked file during rollback: {target}")
+        target.unlink()
+
+
+def sync_worktree(path: str, ref: str, previous: str, signed: str, backup: str) -> None:
+    check_worktree(path, ref, allow_dirty=True)
+    stash = None
+    recovery = f"{backup}/stash"
+    if worktree_dirty(path):
+        old_stash = oid("refs/stash", required=False)
+        git("stash", "push", "--include-untracked", "--message", f"git-fetch-sign {backup}", cwd=path)
+        stash = oid("refs/stash")
+        if stash == old_stash:
+            raise Error("Git could not stash the worktree changes; local branch left unchanged")
+        git("update-ref", recovery, stash, "")
+        print(f"Stashed worktree changes: {recovery}", flush=True)
+    try:
+        check_worktree(path, ref)
+    except Error as exc:
+        # For example, stash cannot clean dirty submodule working directories.
+        # Leave its saved data intact instead of resetting a still-dirty tree.
+        raise Error(f"{exc}; saved changes retained at {recovery}" if stash else str(exc)) from exc
+    try:
+        git("reset", "--keep", signed, cwd=path)
+        if stash:
+            # Apply by object ID, preserving the index. Drop only after success:
+            # this has pop semantics without risking a different worktree's stash.
+            git("stash", "apply", "--index", stash, cwd=path)
+    except (Error, OSError, KeyboardInterrupt) as exc:
+        if not stash:
+            raise
+        print("Sync or stash restoration failed; reverting the sync...", flush=True)
+        try:
+            current = git("symbolic-ref", "--quiet", "HEAD", cwd=path).decode().strip()
+            if current != ref or oid(ref) not in (previous, signed):
+                raise Error("Branch changed during sync; refusing to reset it")
+            # Original tracked changes are saved in our stash. Discard only the
+            # failed application, then restore the original branch and changes.
+            git("reset", "--hard", previous, cwd=path)
+            remove_restored_untracked(path, stash)
+            git("stash", "apply", "--index", stash, cwd=path)
+        except (Error, OSError, KeyboardInterrupt) as rollback:
+            raise Error(f"{exc}; recovery failed: {rollback}. "
+                        f"Saved changes retained at {recovery} ({stash})") from rollback
+        drop_saved_stash(path, stash, recovery)
+        raise Error(f"{exc}; sync reverted and original worktree changes restored") from exc
+    if stash:
+        drop_saved_stash(path, stash, recovery)
+        print("Restored stashed worktree changes", flush=True)
+
+
+def commit_parts(raw: bytes) -> tuple[list[bytes], bytes]:
+    header, message = raw.split(b"\n\n", 1)
+    fields: list[bytes] = []
+    for line in header.split(b"\n"):
+        if line.startswith(b" "):
+            fields[-1] += b"\n" + line
+        else:
+            fields.append(line)
+    return fields, message
+
+
+def unsigned(raw: bytes) -> bytes:
+    fields, message = commit_parts(raw)
+    return b"\n".join(f for f in fields if f.split(b" ", 1)[0]
+                      not in (b"gpgsig", b"gpgsig-sha256")) + b"\n\n" + message
+
+
+def sign_commit(old: str, rewritten: dict[str, str]) -> str:
+    raw = git("cat-file", "commit", old)
+    fields, message = commit_parts(raw)
+    env = os.environ.copy()
+    args: list[str] = []
+    expected: list[bytes] = []
+    encoding = "UTF-8"
+    for field in fields:
+        kind, value = field.split(b" ", 1)
+        if kind in (b"gpgsig", b"gpgsig-sha256"):
+            continue
+        if kind == b"tree":
+            args.insert(0, value.decode())
+        elif kind == b"parent":
+            parent = rewritten.get(value.decode(), value.decode())
+            args.extend(["-p", parent])
+            field = b"parent " + parent.encode()
+        elif kind in (b"author", b"committer"):
+            match = re.fullmatch(rb"(.*) <([^<>]*)> (\d+ [+-]\d{4})", value)
+            if not match:
+                raise Error(f"Unsupported {kind.decode()} identity in {old}")
+            prefix = "GIT_" + kind.decode().upper()
+            env[prefix + "_NAME"] = os.fsdecode(match[1])
+            env[prefix + "_EMAIL"] = os.fsdecode(match[2])
+            env[prefix + "_DATE"] = "@" + match[3].decode()
+        elif kind == b"encoding":
+            encoding = value.decode("ascii")
+        else:
+            raise Error(f"Unsupported commit header {kind.decode(errors='replace')} in {old}")
+        expected.append(field)
+    new = git("-c", f"i18n.commitEncoding={encoding}", "commit-tree", *args,
+              "-S", "-F", "-", data=message, env=env).decode().strip()
+    if unsigned(git("cat-file", "commit", new)) != b"\n".join(expected) + b"\n\n" + message:
+        raise Error(f"Signing unexpectedly changed commit metadata or contents: {old}")
+    git("verify-commit", new)
+    return new
+
+
+def push_signed(remote: str, ref: str, source: str, signed: str) -> None:
+    # updateInstead handles both primary and linked remote worktrees. Applying
+    # it to this receive-pack invocation avoids changing remote configuration
+    # or temporarily leaving the remote worktree on a detached HEAD.
+    git("-c", "push.followTags=false", "-c", f"remote.{remote}.mirror=false",
+        "push", f"--force-with-lease={ref}:{source}", "--recurse-submodules=no",
+        "--receive-pack=git -c receive.denyCurrentBranch=updateInstead receive-pack",
+        "--", remote, f"{signed}:{ref}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("branch", nargs="?", help="Branch name (default: current worktree's branch; or use --pr)")
+    parser.add_argument("--pr", help="Look up the branch via GitHub's API using a PR number or URL")
+    parser.add_argument("--repo", help="GitHub repository for --pr NUMBER (default: gh repository context)")
+    parser.add_argument("--worktree", type=Path, help="Create the branch's missing worktree at PATH")
+    parser.add_argument("--remote", required=True, help="Configured remote to fetch from and push back to")
+    parser.add_argument("--upstream", help="Upstream branch to fetch and protect (default: origin/master, or origin/main)")
+    parser.add_argument("--base", help="Additional base ref to exclude for stacked branches")
+    parser.add_argument("--no-push", action="store_true", help="Keep the signed branch local instead of pushing it back")
+    parser.add_argument("--dry-run", action="store_true", help="Fetch and show commits without signing, syncing, or pushing")
+    args = parser.parse_args()
+    if args.branch is not None and args.pr is not None:
+        parser.error("BRANCH and --pr NUMBER/URL are mutually exclusive")
+    if args.repo is not None and args.pr is None:
+        parser.error("--repo requires --pr")
+    if args.pr is not None:
+        args.branch = pr_branch(args.pr, args.repo)
+    elif args.branch is None:
+        git("rev-parse", "--git-dir")
+        current = git("symbolic-ref", "--quiet", "HEAD", check=False).decode().strip()
+        if not current.startswith("refs/heads/"):
+            raise Error("Detached HEAD; pass BRANCH or --pr NUMBER/URL")
+        args.branch = current.removeprefix("refs/heads/")
+    ref = f"refs/heads/{args.branch}"
+    git("check-ref-format", ref)
+    if args.branch.startswith("-"):
+        raise Error("Branch name must not start with '-'")
+    if git("rev-parse", "--is-shallow-repository").strip() == b"true":
+        raise Error("A complete repository is required; unshallow it first")
+    # Require a configured remote rather than interpreting this option as a URL.
+    git("remote", "get-url", "--", args.remote)
+    previous = oid(ref, required=False)
+    checkout = branch_worktree(ref)
+    new_worktree = os.path.abspath(args.worktree.expanduser()) if args.worktree else None
+    if checkout:
+        if new_worktree and Path(checkout).resolve() != Path(new_worktree).resolve():
+            raise Error(f"Branch already has a worktree at {checkout}; --worktree must match it")
+    elif not new_worktree:
+        raise Error(f"No local worktree for {args.branch}; pass --worktree PATH to create it")
+    elif os.path.lexists(new_worktree):
+        raise Error(f"Worktree destination already exists: {new_worktree}")
+    check_worktree(checkout, ref, allow_dirty=True)
+    upstream_ref, upstream_tip = fetch_upstream(args.upstream)
+    base_ref = args.base or upstream_ref
+    base_tip = oid(base_ref)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    backup = f"refs/fetch-sign/{stamp}-{uuid.uuid4().hex[:8]}"
+    # A unique source ref avoids FETCH_HEAD races and keeps the fetched tip recoverable.
+    git("fetch", "--no-tags", "--no-recurse-submodules", "--", args.remote,
+        f"refs/heads/{args.branch}:{backup}/source")
+    source = oid(f"{backup}/source")
+    if not git("merge-base", "--all", upstream_tip, source, check=False).strip():
+        raise Error("Fetched branch and upstream have no shared history; local branch left unchanged")
+    # Exclude the whole upstream history, including commits brought in through
+    # merge parents. A merge-base cutoff can incorrectly include those commits.
+    commits = git("rev-list", "--reverse", "--topo-order", source,
+                  f"^{upstream_tip}", f"^{base_tip}").decode().splitlines()
+    print(f"Fetched {args.remote}/{args.branch}: {source}", flush=True)
+    print(f"Protected upstream: {upstream_ref}; base: {base_ref}; {len(commits)} commit(s)", flush=True)
+    for commit in commits:
+        subject = git("show", "-s", "--format=%s", commit).decode(errors="replace").strip()
+        print(f"  {commit[:12]} {subject}", flush=True)
+    if checkout is None:
+        print(f"Will create worktree: {new_worktree}", flush=True)
+    if args.dry_run:
+        git("update-ref", "-d", f"{backup}/source", source)
+        return
+    if previous:
+        git("update-ref", f"{backup}/previous", previous, "")
+    print(f"Recovery refs: {backup}/{{source,previous,signed}}", flush=True)
+    rewritten: dict[str, str] = {}
+    for i, commit in enumerate(commits, 1):
+        rewritten[commit] = sign_commit(commit, rewritten)
+        print(f"Signed {i}/{len(commits)}: {rewritten[commit]}", flush=True)
+    signed = rewritten.get(source, source)
+    git("update-ref", f"{backup}/signed", signed, "")
+    # Recheck just before touching the branch; never discard working tree edits.
+    if oid(ref, required=False) != previous or branch_worktree(ref) != checkout:
+        raise Error("Local branch changed during signing; local branch left unchanged")
+    check_worktree(checkout, ref, allow_dirty=True)
+    if checkout:
+        sync_worktree(checkout, ref, previous, signed, backup)
+    else:
+        # Create only after every signature has been verified. Do not force an
+        # existing directory or branch checked out by another worktree.
+        if previous:
+            git("worktree", "add", "--", new_worktree, args.branch)
+            check_worktree(new_worktree, ref)
+            git("reset", "--keep", signed, cwd=new_worktree)
+        else:
+            git("worktree", "add", "-b", args.branch, "--", new_worktree, signed)
+        checkout = new_worktree
+    print(f"Updated {args.branch}: {signed}")
+    if checkout:
+        print(f"Updated worktree: {checkout}")
+    if previous:
+        print(f"Previous local tip: {backup}/previous")
+    if args.no_push:
+        print("No commits pushed (--no-push)")
+    else:
+        try:
+            push_signed(args.remote, ref, source, signed)
+        except (Error, OSError) as exc:
+            raise Error(f"Local sync succeeded at {signed}, but push to {args.remote} failed: {exc}. "
+                        "The signed local branch and recovery refs have been retained") from exc
+        print(f"Pushed signed branch to {args.remote}/{args.branch}: {signed}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (Error, OSError, ValueError) as exc:
+        print(f"git-fetch-sign: {exc}", file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print("git-fetch-sign: interrupted", file=sys.stderr)
+        sys.exit(130)

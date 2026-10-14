@@ -1,0 +1,150 @@
+.TH GIT-FETCH-SIGN "1" "October 14, 2026" "git-fetch-sign" "User Commands"
+.SH NAME
+git-fetch-sign \- fetch a remote topic branch and sign its commits locally
+.SH SYNOPSIS
+.B git fetch-sign
+\fB\-\-remote\fR NAME [BRANCH] [\fB\-\-worktree\fR PATH] [OPTIONS]
+.br
+.B git fetch-sign
+\fB\-\-remote\fR NAME \fB\-\-pr\fR NUMBER|URL
+[\fB\-\-repo\fR OWNER/REPO]
+[\fB\-\-worktree\fR PATH] [OPTIONS]
+.SH DESCRIPTION
+Fetch BRANCH from the configured remote selected by --remote, recreate its
+topic commits with local Git signatures, verify them, then replace the same
+local branch.
+After the local sync succeeds, force-push the signed tip back to the source
+remote, using a lease on the exact fetched commit ID.
+The --remote argument is required; there is no default source remote.
+Use --no-push to keep the result local.
+Run from any worktree in the repository. If the branch is checked out in a
+linked worktree, that worktree is updated. Local staged, unstaged, and untracked
+changes are automatically stashed immediately before replacing the branch,
+then restored with their staging state after the sync. Ignored files are not
+stashed. Worktrees with unresolved conflicts or an ongoing Git operation
+are refused.
+Other worktrees are untouched.
+.PP
+If restoring the stash fails, the sync is reverted to the previous local tip
+and the stash is reapplied there. A reverted sync exits with an error even
+when the original changes were restored successfully. Existing stashes are
+preserved. If recovery also fails, the saved stash is retained and its recovery
+ref is printed. Fetching and signing happen before stashing, so failures in
+either step leave the original worktree changes in place.
+.PP
+If BRANCH and --pr are omitted, use the current worktree's checked-out branch.
+Detached HEAD requires an explicit BRANCH or --pr.
+Supply either BRANCH or --pr, never both. The --pr option queries GitHub's API
+through gh pr view to resolve the PR's head branch name. A number uses gh's
+repository context unless --repo is supplied; a full PR URL selects the PR
+directly. The resolved branch is fetched from the selected source remote.
+.PP
+The branch must have a local worktree. If none exists, --worktree PATH is
+required, even for a dry run. PATH must not already exist. After successful
+signing, the utility creates the worktree and checks out the signed branch,
+creating the local branch if necessary. Signing failures create no worktree.
+If the branch already has a worktree, an explicit PATH must match it.
+.PP
+Every run first fetches upstream master from origin, or main if master does
+not exist on that remote. The advertised remote branches are checked even if
+origin/HEAD is stale or the upstream tracking ref is missing locally.
+Use --upstream REMOTE/BRANCH to select a different upstream.
+.PP
+Only commits absent from the fetched upstream history are signed. All commits
+reachable from upstream keep their original IDs and signatures, including
+commits brought in through merge parents. Local master/main branches are not
+updated by the upstream fetch. Use --base REF to additionally exclude the
+history of a stacked parent branch; it cannot disable upstream protection.
+The explicit base ref is read locally. If the fetched branch is entirely
+upstream history, it is synced without recreating or signing any commits.
+An upstream fetch failure prevents signing and branch replacement.
+.PP
+Every selected topic commit, including merge and empty commits, is signed using
+Git's configured signing key and program. Commit trees, messages, author and
+committer identities, dates, and parent ordering are preserved.
+Topic parent IDs are replaced with their signed equivalents.
+Existing signatures are replaced.
+Unsupported extra commit headers (for example mergetag) cause an error.
+.PP
+Signing changes commit IDs. The local branch is replaced only after all new
+commits pass signature and metadata verification. Signing failures leave the
+branch and its checkout unchanged. Shallow repositories are rejected.
+.PP
+For SSH and local transports, the push invokes receive-pack with
+receive.denyCurrentBranch=updateInstead for that invocation only.
+Git updates a checked-out branch and its primary or linked worktree together,
+without detaching HEAD or changing remote configuration. A dirty remote
+index or worktree causes Git to refuse the push; remote edits are preserved.
+The lease also rejects a remote branch changed since the fetch.
+If pushing fails, the signed local branch and recovery refs are retained,
+and the utility exits with an error. A reverted local sync never pushes.
+.SH OPTIONS
+.TP
+\fB\-\-pr\fR NUMBER|URL
+Resolve the branch name via GitHub. Mutually exclusive with BRANCH.
+.TP
+\fB\-\-repo\fR OWNER/REPO
+Select the GitHub repository for a PR number. Requires --pr.
+.TP
+\fB\-\-worktree\fR PATH
+Create the branch's missing worktree at PATH after signature verification.
+Required when the branch has no local worktree. Existing paths are refused;
+if the branch already has a worktree, its current path is accepted.
+.TP
+\fB\-\-remote\fR NAME
+Required configured source remote. No default.
+The signed branch is pushed back to this remote after the local sync.
+.TP
+\fB\-\-no-push\fR
+Keep the signed branch local without pushing it back to the source remote.
+.TP
+\fB\-\-upstream\fR REMOTE/BRANCH
+Upstream branch to fetch and protect. Default: origin/master, falling back to
+origin/main only when master does not exist on origin.
+.TP
+\fB\-\-base\fR REF
+Additional local ref whose reachable commits are excluded from signing.
+Select the parent branch for stacked work. Upstream history is always excluded.
+.TP
+\fB\-\-dry-run\fR
+Fetch and list the signing range without signing, replacing the local branch,
+creating a worktree, stashing local changes, or pushing.
+Upstream tracking refs, fetched objects, and FETCH_HEAD may change;
+the temporary source ref is removed.
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Display usage.
+.SH RECOVERY
+Runs retain refs under refs/fetch-sign/TIMESTAMP-ID/: source is the fetched tip,
+previous is the old local tip (if it existed), and signed is the verified new
+tip (once signing completes). A stash ref is also retained if stashed changes
+could not be restored. The namespace is printed. These refs keep commits
+reachable and can be used with git log, git diff, and git reset.
+.PP
+To restore a checked-out branch, run git reset --keep REF/previous from its
+worktree, substituting the printed recovery namespace for REF. For a branch
+that is not checked out, use git update-ref refs/heads/BRANCH REF/previous.
+.PP
+If automatic recovery failed, inspect the current worktree before retrying
+git stash apply --index REF/stash. The retained stash also remains in the stash
+list. Its recovery ref is removed only after a successful restoration.
+.PP
+Existing branch tracking configuration is preserved. The automatic push goes
+to the selected source remote only.
+.SH EXAMPLE
+.nf
+cd /path/to/repository
+git fetch-sign --remote workstation
+git fetch-sign --remote workstation --dry-run feature/example
+git fetch-sign --remote workstation feature/example
+git fetch-sign --remote workstation --pr 123 --repo owner/repo
+git fetch-sign --remote workstation \\
+  --pr https://github.com/owner/repo/pull/123 \\
+  --worktree ../repository-pr/123-topic
+.fi
+.SH REQUIREMENTS
+Python 3.10 or newer, Git, access to the source remote, and a working local Git
+signing configuration (for PGP, user.signingkey and GnuPG with its private key).
+The --pr option additionally requires gh with GitHub API access.
+.SH SEE ALSO
+git-commit-tree(1), git-verify-commit(1), git-update-ref(1), git-stash(1)
