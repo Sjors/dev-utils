@@ -156,6 +156,71 @@ ln -s "$PWD/share/man/man1/git-fetch-sign.1" ~/share/man/man1/git-fetch-sign.1
 git fetch-sign --help
 ```
 
+## `guix.sh`
+
+Fetch Guix attestation checksums over SSH, sign them locally with GnuPG, and
+commit them in a signatures repository. Supports Bitcoin Core
+([guix.sigs](https://github.com/bitcoin-core/guix.sigs)) and sv2-tp
+([sv2-tp-guix.sigs](https://github.com/stratum-mining/sv2-tp-guix.sigs)).
+Requires Bash, Git, OpenSSH `scp`, GnuPG, and
+a configured secret signing key. This signs downloaded checksums; it does not
+build the release, recompute checksums, or verify binaries. Review the build
+and checksums before running it.
+
+Set `SIGNER` to your attestation directory name (case-sensitive). There is no
+default identity or push destination:
+
+```sh
+SIGNER=alice ~/utils/guix.sh bitcoin 31.0 build-host
+SIGNER=alice ~/utils/guix.sh sv2-tp 1.1.0 build-host --push my-fork
+~/utils/guix.sh --help
+```
+
+The SSH host is an alias or `[user@]hostname`; use an SSH config alias for
+custom ports or IPv6 addresses. The Git remote passed to `--push` must already
+exist in the local signatures repository. Without `--push`, the commit stays
+local for review.
+
+Environment overrides:
+
+| Variable | Purpose | Default |
+| --- | --- | --- |
+| `SIGNER` | Attestation directory and branch/commit identity | Required |
+| `SIGS_DIR` | Local signatures repository root | `$HOME/guix.sigs` or `$HOME/sv2-tp-guix.sigs` |
+| `REMOTE_SIGS_DIR` | Absolute or home-relative remote repository path | `guix.sigs` or `sv2-tp-guix.sigs` |
+| `BASE_BRANCH` | Local base branch with an upstream configured | `main` |
+| `GPG_KEY` | GPG signing key fingerprint | GnuPG's default key |
+
+For example, with custom checkout locations and an explicit signing key:
+
+```sh
+SIGNER=alice SIGS_DIR="$HOME/src/guix.sigs" \
+  REMOTE_SIGS_DIR=/srv/build/guix.sigs GPG_KEY=YOUR_KEY_FINGERPRINT \
+  ~/utils/guix.sh bitcoin 31.0 build-host --push my-fork
+```
+
+Replace `YOUR_KEY_FINGERPRINT` with your key fingerprint.
+Signer names use letters, digits, underscores and hyphens, starting with a
+letter or digit. Versions are exact directory names, starting with a letter
+or digit and using letters, digits, dots, underscores or hyphens; they must
+also produce a valid Git branch name. Remote paths cannot contain spaces or
+shell metacharacters. Local paths may contain spaces.
+
+The local repository must be clean, including untracked files, with no merge,
+rebase or cherry-pick in progress. The script downloads into a temporary
+directory, creates fresh local signatures, checks out `BASE_BRANCH`, and pulls
+its upstream with `--ff-only`. It leaves you on a new `<version>-<SIGNER>`
+branch, adding `-codesigned` when `all.SHA256SUMS` exists. Existing branches
+are refused. Only `noncodesigned.SHA256SUMS`, optional `all.SHA256SUMS`, and
+their new `.asc` signatures are copied and committed; other downloaded files
+and remote signatures are excluded. `noncodesigned.SHA256SUMS` is required
+even for codesigned builds. Temporary downloads are removed on exit. If a
+later Git operation or push fails, inspect the local branch and working tree
+before retrying; the script does not roll back Git operations.
+
+Published attestations use the chosen signer name and GPG key. Commits also
+use your configured Git name/email and any configured commit-signing key.
+
 ## `guix-try`
 
 Fetch a macOS guix build from a remote SSH host, extract it, ad hoc codesign it
