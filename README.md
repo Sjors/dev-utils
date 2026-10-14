@@ -283,6 +283,16 @@ By default the selected temp root is cleared before use. Pass `--preserve` or
 
 ## Tests
 
+Regenerate the `git-range-diff-remote` manual with help2man 1.49.3, using the
+same fixed date as CI so the result does not depend on the current month:
+
+```sh
+SOURCE_DATE_EPOCH=1780272000 TZ=UTC help2man ./git-range-diff-remote --no-info \
+  --name "range-diff local commits against a PR's remote state" \
+  -o share/man/man1/git-range-diff-remote.1
+git diff --exit-code -- share/man/man1/git-range-diff-remote.1
+```
+
 ```sh
 brew install bats-core
 bats tests/

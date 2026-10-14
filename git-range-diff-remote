@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # To regenerate the man page after editing the usage() text:
-#   help2man git-range-diff-remote --no-info \
+#   SOURCE_DATE_EPOCH=1780272000 TZ=UTC help2man ./git-range-diff-remote --no-info \
 #     --name "range-diff local commits against a PR's remote state" \
 #     -o share/man/man1/git-range-diff-remote.1
 set -euo pipefail

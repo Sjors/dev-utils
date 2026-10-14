@@ -12,6 +12,10 @@ jobs:
       - name: Install help2man
         run: sudo apt-get update && sudo apt-get install -y help2man
       - name: Check generated man page
+        env:
+          # Keep the manual's June 2026 date independent of the CI clock.
+          SOURCE_DATE_EPOCH: "1780272000"
+          TZ: UTC
         run: |
           help2man ./git-range-diff-remote --no-info \
             --name "range-diff local commits against a PR's remote state" \
