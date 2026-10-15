@@ -99,6 +99,35 @@ class FetchSignTests(unittest.TestCase):
         mock.chmod(0o755)
         self.env["PATH"] = str(bin_dir) + os.pathsep + self.env["PATH"]
 
+    def mock_ssh_remote(self, *, path="/home/remote/repository-pr/topic", branch="topic",
+                        home="/home/remote", url="remote:~/repository", fail=False):
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir(exist_ok=True)
+        self.ssh_log = self.root / "ssh-lookup.json"
+        self.local_home = self.root / "local home"
+        tip = self.git("rev-parse", "topic", cwd=self.source).strip()
+        listing = (f"worktree {path}\0HEAD {tip}\0branch refs/heads/{branch}\0\0").encode()
+        payload = home.encode() + b"\0" + listing
+        mock = bin_dir / "ssh"
+        mock.write_text(
+            f"#!{sys.executable}\n"
+            "import json, os, pathlib, shlex, sys\n"
+            "command = sys.argv[-1]\n"
+            "if 'worktree list --porcelain -z' in command:\n"
+            f"    pathlib.Path({str(self.ssh_log)!r}).write_text(json.dumps(sys.argv[1:]))\n"
+            f"    sys.stdout.buffer.write({payload!r})\n"
+            f"    sys.exit({1 if fail else 0})\n"
+            "args = shlex.split(command)\n"
+            f"args[-1] = {str(self.source)!r}\n"
+            "os.execvp(args[0], args)\n"
+        )
+        mock.chmod(0o755)
+        self.env["PATH"] = str(bin_dir) + os.pathsep + self.env["PATH"]
+        self.env["GIT_SSH_VARIANT"] = "ssh"
+        self.env["HOME"] = str(self.local_home)
+        self.git("remote", "set-url", "workstation", url)
+        return self.local_home / "repository-pr" / "topic"
+
     def assert_signed_history(self):
         old = self.git("rev-list", "--reverse", "--topo-order", f"{self.base}..{self.source_before}",
                        cwd=self.source).splitlines()
@@ -415,6 +444,85 @@ class FetchSignTests(unittest.TestCase):
         self.assertIn("--worktree PATH", result.stderr)
         self.assertEqual(self.git("rev-parse", "topic").strip(), self.previous)
         self.assertEqual(self.git("for-each-ref", "refs/fetch-sign"), "")
+
+    def test_mirrors_remote_home_path_for_missing_worktree(self):
+        linked = self.mock_ssh_remote()
+        self.run_script("topic")
+        self.assertTrue(linked.is_dir())
+        self.assertEqual(self.git("symbolic-ref", "--short", "HEAD", cwd=linked).strip(), "topic")
+        self.assertEqual((linked / "file").read_text(), "remote content\n")
+        self.assert_signed_history()
+
+    def test_mirrored_worktree_creates_missing_branch(self):
+        linked = self.mock_ssh_remote()
+        self.git("branch", "-D", "topic")
+        self.run_script("topic")
+        self.git("verify-commit", "HEAD", cwd=linked)
+        self.assertEqual(self.git("rev-parse", "HEAD", cwd=linked),
+                         self.git("rev-parse", "topic", cwd=self.source))
+
+    def test_mirrored_dry_run_does_not_create_worktree(self):
+        linked = self.mock_ssh_remote()
+        result = self.run_script("topic", "--dry-run")
+        self.assertIn(f"Will create worktree: {linked}", result.stdout)
+        self.assertFalse(linked.exists())
+        self.assertEqual(self.git("rev-parse", "topic").strip(), self.previous)
+
+    def test_mirrored_existing_destination_refused(self):
+        linked = self.mock_ssh_remote()
+        linked.mkdir(parents=True)
+        (linked / "keep").write_text("preserve")
+        result = self.run_script("topic", ok=False)
+        self.assertIn("destination already exists", result.stderr)
+        self.assertEqual((linked / "keep").read_text(), "preserve")
+        self.assertEqual(self.git("for-each-ref", "refs/fetch-sign"), "")
+
+    def test_explicit_worktree_skips_remote_lookup(self):
+        mirrored = self.mock_ssh_remote(fail=True)
+        linked = self.root / "explicit"
+        self.run_script("topic", "--worktree", str(linked))
+        self.assertTrue(linked.is_dir())
+        self.assertFalse(self.ssh_log.exists())
+        self.assertFalse(mirrored.exists())
+
+    def test_existing_checkout_skips_remote_lookup(self):
+        self.mock_ssh_remote(fail=True)
+        self.git("switch", "topic")
+        self.run_script()
+        self.assertFalse(self.ssh_log.exists())
+        self.assert_signed_history()
+
+    def test_remote_worktree_lookup_failure_preserves_branch(self):
+        self.mock_ssh_remote(fail=True)
+        result = self.run_script("topic", ok=False)
+        self.assertIn("Remote worktree lookup failed", result.stderr)
+        self.assertIn("--worktree PATH", result.stderr)
+        self.assertEqual(self.git("rev-parse", "topic").strip(), self.previous)
+        self.assertEqual(self.git("for-each-ref", "refs/fetch-sign"), "")
+
+    def test_no_matching_remote_worktree_requires_path(self):
+        self.mock_ssh_remote(branch="different-topic")
+        result = self.run_script("topic", ok=False)
+        self.assertIn("No worktree for topic on workstation", result.stderr)
+        self.assertIn("--worktree PATH", result.stderr)
+
+    def test_remote_worktree_outside_home_requires_path(self):
+        self.mock_ssh_remote(path="/srv/repository-pr/topic")
+        result = self.run_script("topic", ok=False)
+        self.assertIn("outside its home directory", result.stderr)
+
+    def test_remote_worktree_parent_traversal_refused(self):
+        self.mock_ssh_remote(path="/home/remote/../outside/topic")
+        result = self.run_script("topic", ok=False)
+        self.assertIn("contains '..'", result.stderr)
+
+    def test_ssh_url_port_and_quoted_path(self):
+        linked = self.mock_ssh_remote(url="ssh://user@remote:2222/~/repository%20with%20spaces")
+        self.run_script("topic", "--dry-run")
+        arguments = json.loads(self.ssh_log.read_text())
+        self.assertEqual(arguments[:4], ["-p", "2222", "--", "user@remote"])
+        self.assertIn('git -C "$HOME"/\'repository with spaces\'', arguments[-1])
+        self.assertFalse(linked.exists())
 
     def test_creates_worktree_for_existing_branch(self):
         linked = self.root / "linked"

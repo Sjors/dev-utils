@@ -130,10 +130,17 @@ it from the selected remote.
 PR numbers use the current `gh` repository context; `--repo owner/repo`
 selects a repository explicitly.
 
-The branch must have a local worktree. If it has none, supply `--worktree PATH`
-to create one after signing succeeds. The destination must not exist.
-`--dry-run` also requires this option for a missing worktree, but creates
-nothing. If the branch already has a worktree, an explicit path must match it.
+If the branch has no local worktree, SSH remotes are inspected to find the
+branch's worktree path. Its path relative to the remote user's home is mirrored
+under your local home: `/home/alice/project-pr/topic` becomes
+`~/project-pr/topic`. Both `host:path` and `ssh://user@host:port/path` URLs are
+supported. The new worktree is created only after signing succeeds.
+
+`--worktree PATH` overrides the inferred location. It is required for other
+transports, a branch with no remote worktree, a remote worktree outside the
+remote home, or an unavailable SSH lookup. The destination must not already
+exist. `--dry-run` reports the location without creating it. If the branch
+already has a local worktree, it is reused and an explicit path must match it.
 
 Each run fetches `master` from `origin` first, falling back to `main` only
 if the remote has no `master`. All commits reachable from that fetched tip

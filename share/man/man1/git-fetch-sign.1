@@ -1,4 +1,4 @@
-.TH GIT-FETCH-SIGN "1" "October 14, 2026" "git-fetch-sign" "User Commands"
+.TH GIT-FETCH-SIGN "1" "October 15, 2026" "git-fetch-sign" "User Commands"
 .SH NAME
 git-fetch-sign \- fetch a remote topic branch and sign its commits locally
 .SH SYNOPSIS
@@ -39,11 +39,19 @@ through gh pr view to resolve the PR's head branch name. A number uses gh's
 repository context unless --repo is supplied; a full PR URL selects the PR
 directly. The resolved branch is fetched from the selected source remote.
 .PP
-The branch must have a local worktree. If none exists, --worktree PATH is
-required, even for a dry run. PATH must not already exist. After successful
-signing, the utility creates the worktree and checks out the signed branch,
-creating the local branch if necessary. Signing failures create no worktree.
-If the branch already has a worktree, an explicit PATH must match it.
+If the branch has no local worktree, query the SSH remote's worktree list.
+Mirror the branch's remote worktree path relative to the remote user's home
+under the local home directory. For example, /home/alice/project-pr/topic
+becomes ~/project-pr/topic. Both host:path and ssh://user@host:port/path URLs
+are supported, using the ssh command and its normal SSH configuration.
+.PP
+Use --worktree PATH to override this location. An explicit path is required
+for non-SSH transports, a branch without a remote worktree, a remote worktree
+outside the remote home, or an unavailable SSH lookup. The destination must
+not already exist. After successful signing, create the worktree and check out
+the signed branch, creating the local branch if necessary. Signing failures
+create no worktree. A dry run only reports the chosen path. Existing local
+worktrees are reused; an explicit PATH must match an existing worktree.
 .PP
 Every run first fetches upstream master from origin, or main if master does
 not exist on that remote. The advertised remote branches are checked even if
@@ -88,8 +96,10 @@ Select the GitHub repository for a PR number. Requires --pr.
 .TP
 \fB\-\-worktree\fR PATH
 Create the branch's missing worktree at PATH after signature verification.
-Required when the branch has no local worktree. Existing paths are refused;
-if the branch already has a worktree, its current path is accepted.
+By default, mirror its SSH remote worktree path under the local home.
+This option overrides inference and is required if no path can be inferred.
+Existing paths are refused; if the branch already has a local worktree,
+its current path is accepted.
 .TP
 \fB\-\-remote\fR NAME
 Required configured source remote. No default.
@@ -146,5 +156,6 @@ git fetch-sign --remote workstation \\
 Python 3.10 or newer, Git, access to the source remote, and a working local Git
 signing configuration (for PGP, user.signingkey and GnuPG with its private key).
 The --pr option additionally requires gh with GitHub API access.
+Automatic remote worktree path discovery requires SSH access and a POSIX shell.
 .SH SEE ALSO
 git-commit-tree(1), git-verify-commit(1), git-update-ref(1), git-stash(1)
