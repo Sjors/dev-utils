@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 from datetime import datetime, timezone
 import os
 from pathlib import Path, PurePosixPath
@@ -195,7 +196,8 @@ def mirror_remote_worktree(remote: str, ref: str) -> str:
 
 
 def worktree_dirty(path: str) -> bool:
-    return bool(git("status", "--porcelain", "--untracked-files=all", cwd=path))
+    return bool(git("status", "--porcelain", "--untracked-files=all",
+                    "--ignore-submodules=none", cwd=path))
 
 
 def check_worktree(path: str | None, ref: str, allow_dirty: bool = False) -> None:
@@ -253,7 +255,7 @@ def remove_restored_untracked(path: str, stash: str) -> None:
         target.unlink()
 
 
-def sync_worktree(path: str, ref: str, previous: str, signed: str, backup: str) -> None:
+def sync_worktree(path: str, ref: str, previous: str, signed: str, backup: str) -> str | None:
     check_worktree(path, ref, allow_dirty=True)
     stash = None
     recovery = f"{backup}/stash"
@@ -296,8 +298,50 @@ def sync_worktree(path: str, ref: str, previous: str, signed: str, backup: str) 
         drop_saved_stash(path, stash, recovery)
         raise Error(f"{exc}; sync reverted and original worktree changes restored") from exc
     if stash:
-        drop_saved_stash(path, stash, recovery)
+        # Keep the original snapshot until the push succeeds. A later push
+        # failure must restore its exact index and untracked files at previous.
         print("Restored stashed worktree changes", flush=True)
+    return stash
+
+
+
+def worktree_state(path: str) -> tuple[bytes, bytes, tuple]:
+    untracked = []
+    for name in git("ls-files", "--others", "--exclude-standard", "-z", cwd=path).split(b"\0"):
+        if not name:
+            continue
+        target = Path(path) / os.fsdecode(name)
+        mode = target.lstat().st_mode
+        data = os.fsencode(os.readlink(target)) if stat.S_ISLNK(mode) else target.read_bytes()
+        untracked.append((name, mode, hashlib.sha256(data).digest()))
+    return (git("diff", "--cached", "--binary", "--no-ext-diff", cwd=path),
+            git("diff", "--binary", "--no-ext-diff", cwd=path), tuple(untracked))
+
+
+def rollback_sync(path: str, ref: str, previous: str, signed: str,
+                  backup: str, stash: str | None, expected_state: tuple) -> None:
+    check_worktree(path, ref, allow_dirty=True)
+    current_path = branch_worktree(ref)
+    if oid(ref) != signed or current_path is None or Path(current_path).resolve() != Path(path).resolve():
+        raise Error("Branch changed during sync; refusing to reset it")
+    if stash:
+        if worktree_state(path) != expected_state:
+            raise Error("Worktree changed during push; original changes retained at " + backup + "/stash")
+        # The original index, tracked edits, and untracked files remain saved.
+        # Discard only the verified restored application on the signed tip,
+        # then reapply that original snapshot against its original base.
+        git("reset", "--hard", previous, cwd=path)
+        remove_restored_untracked(path, stash)
+        git("stash", "apply", "--index", stash, cwd=path)
+        drop_saved_stash(path, stash, backup + "/stash")
+    else:
+        # Preserve concurrent edits and refuse any conflicting reset.
+        git("reset", "--keep", previous, cwd=path)
+
+
+def warn_skip(branch: str, reason: str, override: str) -> None:
+    print(f"git-fetch-sign: warning: skipping {branch}: {reason}; "
+          f"use {override} to override", file=sys.stderr, flush=True)
 
 
 def commit_parts(raw: bytes) -> tuple[list[bytes], bytes]:
@@ -380,6 +424,8 @@ def main() -> None:
     parser.add_argument("--remote", required=True, help="Configured remote to fetch from and push back to")
     parser.add_argument("--upstream", help="Upstream branch to fetch and protect (default: origin/master, or origin/main)")
     parser.add_argument("--base", help="Stacked base ref to exclude (default: detect a published parent branch)")
+    parser.add_argument("--allow-dirty", action="store_true", help="Stash and restore local edits instead of skipping dirty worktrees")
+    parser.add_argument("--allow-unpushed", action="store_true", help="Allow replacement of local commits absent from the freshly fetched source branch")
     parser.add_argument("--no-push", action="store_true", help="Keep the signed branch local instead of pushing it back")
     parser.add_argument("--dry-run", action="store_true", help="Fetch and show commits without signing, syncing, or pushing")
     args = parser.parse_args()
@@ -416,6 +462,9 @@ def main() -> None:
         if os.path.lexists(new_worktree):
             raise Error(f"Worktree destination already exists: {new_worktree}; pass --worktree PATH to choose another")
     check_worktree(checkout, ref, allow_dirty=True)
+    if checkout and not args.allow_dirty and worktree_dirty(checkout):
+        warn_skip(args.branch, "uncommitted or untracked changes", "--allow-dirty")
+        return
     upstream_ref, upstream_tip = fetch_upstream(args.upstream)
     base_ref = args.base or upstream_ref
     base_tip = oid(base_ref)
@@ -425,6 +474,11 @@ def main() -> None:
     git("fetch", "--no-tags", "--no-recurse-submodules", "--", args.remote,
         f"refs/heads/{args.branch}:{backup}/source")
     source = oid(f"{backup}/source")
+    if previous and not args.allow_unpushed and git("rev-list", "-1", previous, f"^{source}").strip():
+        warn_skip(args.branch, f"unpushed or divergent commits relative to {args.remote}/{args.branch}",
+                  "--allow-unpushed")
+        git("update-ref", "-d", f"{backup}/source", source)
+        return
     if not git("merge-base", "--all", upstream_tip, source, check=False).strip():
         raise Error("Fetched branch and upstream have no shared history; local branch left unchanged")
     if args.base is None:
@@ -459,8 +513,13 @@ def main() -> None:
     if oid(ref, required=False) != previous or branch_worktree(ref) != checkout:
         raise Error("Local branch changed during signing; local branch left unchanged")
     check_worktree(checkout, ref, allow_dirty=True)
+    if checkout and not args.allow_dirty and worktree_dirty(checkout):
+        warn_skip(args.branch, "worktree became dirty during signing", "--allow-dirty")
+        return
+    stash = None
+    created = checkout is None
     if checkout:
-        sync_worktree(checkout, ref, previous, signed, backup)
+        stash = sync_worktree(checkout, ref, previous, signed, backup)
     else:
         # Create only after all commits pass signing checks. Do not force an
         # existing directory or branch checked out by another worktree.
@@ -472,19 +531,39 @@ def main() -> None:
             git("worktree", "add", "-b", args.branch, "--", new_worktree, signed)
         checkout = new_worktree
     print(f"Updated {args.branch}: {signed}")
-    if checkout:
-        print(f"Updated worktree: {checkout}")
+    print(f"Updated worktree: {checkout}")
     if previous:
         print(f"Previous local tip: {backup}/previous")
-    if args.no_push:
-        print("No commits pushed (--no-push)")
-    else:
-        try:
+    expected_state = worktree_state(checkout) if stash else ()
+    try:
+        if args.no_push:
+            print("No commits pushed (--no-push)")
+        else:
             push_signed(args.remote, ref, source, signed)
-        except (Error, OSError) as exc:
-            raise Error(f"Local sync succeeded at {signed}, but push to {args.remote} failed: {exc}. "
-                        "The signed local branch and recovery refs have been retained") from exc
-        print(f"Pushed signed branch to {args.remote}/{args.branch}: {signed}")
+            print(f"Pushed signed branch to {args.remote}/{args.branch}: {signed}")
+    except (Error, OSError, KeyboardInterrupt) as exc:
+        try:
+            if previous:
+                rollback_sync(checkout, ref, previous, signed, backup, stash, expected_state)
+            if created:
+                # Remove only our new, clean worktree. A concurrent checkout,
+                # commit, or edit prevents removal and leaves recovery refs.
+                check_worktree(checkout, ref)
+                expected = previous or signed
+                current_path = branch_worktree(ref)
+                if oid(ref) != expected or current_path is None or Path(current_path).resolve() != Path(checkout).resolve():
+                    raise Error("New worktree changed; refusing to remove it")
+                git("worktree", "remove", "--", checkout)
+                if not previous:
+                    git("update-ref", "-d", ref, signed)
+        except (Error, OSError, KeyboardInterrupt) as recovery:
+            raise Error(f"push to {args.remote} failed: {exc}; recovery failed: {recovery}. "
+                        f"Recovery refs retained at {backup}") from recovery
+        raise Error(f"push to {args.remote} failed: {exc}; local sync reverted to its previous state. "
+                    f"Recovery refs retained at {backup}") from exc
+    if stash:
+        drop_saved_stash(checkout, stash, backup + "/stash")
+
 
 
 if __name__ == "__main__":

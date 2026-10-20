@@ -83,9 +83,12 @@ class FetchSignTests(unittest.TestCase):
                            ("user.signingkey", "test@example.com"), ("commit.gpgsign", "false")):
             self.git("config", key, value, cwd=path)
 
-    def run_script(self, *args, ok=True, cwd=None, remote="workstation"):
+    def run_script(self, *args, ok=True, cwd=None, remote="workstation", defaults=False):
         self.source_before = self.git("rev-parse", "topic", cwd=self.source).strip()
         command = [sys.executable, str(SCRIPT), *args]
+        # Existing signing scenarios deliberately replace divergent history.
+        if not defaults:
+            command.extend(["--allow-dirty", "--allow-unpushed"])
         if remote is not None:
             command.extend(["--remote", remote])
         result = subprocess.run(command, cwd=cwd or self.local,
@@ -509,7 +512,7 @@ class FetchSignTests(unittest.TestCase):
         self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.source).strip(), self.base)
         self.assertEqual((self.source / "unrelated edits").read_text(), "preserve remote primary worktree")
 
-    def test_dirty_remote_refuses_push_and_preserves_local_signed_tip(self):
+    def test_dirty_remote_refuses_push_and_rolls_back_local_tip(self):
         self.git("switch", "topic")
         remote_tip = self.git("rev-parse", "HEAD", cwd=self.source).strip()
         (self.source / "tracked").write_text("remote edits\n")
@@ -517,13 +520,15 @@ class FetchSignTests(unittest.TestCase):
         (self.source / "tracked").write_text("remote unstaged edits\n")
         status = self.git("status", "--porcelain", "-z", cwd=self.source)
         result = self.run_script(ok=False)
-        self.assertIn("Local sync succeeded", result.stderr)
+        self.assertIn("local sync reverted", result.stderr)
         self.assertIn("push to workstation failed", result.stderr)
         self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.source).strip(), remote_tip)
         self.assertEqual(self.git("status", "--porcelain", "-z", cwd=self.source), status)
         self.assertEqual((self.source / "tracked").read_text(), "remote unstaged edits\n")
         self.assertEqual(self.git("show", ":tracked", cwd=self.source), "remote edits\n")
-        self.assert_signed_history()
+        self.assertEqual(self.git("rev-parse", "topic").strip(), self.previous)
+        self.assertEqual(self.git("status", "--porcelain"), "")
+        self.assertIn("refs/fetch-sign/", self.git("for-each-ref", "refs/fetch-sign"))
 
     def test_no_push_keeps_remote_tip_unchanged(self):
         self.git("switch", "topic")
@@ -543,7 +548,9 @@ class FetchSignTests(unittest.TestCase):
         self.assertNotEqual(self.git("rev-parse", "HEAD", cwd=self.source).strip(), self.source_before)
         self.assertEqual(self.git("show", "-s", "--format=%s", "HEAD", cwd=self.source).strip(),
                          "concurrent remote commit")
-        self.assert_signed_history()
+        self.assertEqual(self.git("rev-parse", "topic").strip(), self.previous)
+        self.assertEqual(self.git("status", "--porcelain"), "")
+        self.assertIn("refs/fetch-sign/", self.git("for-each-ref", "refs/fetch-sign"))
 
     def test_dirty_target_stashed_with_index_and_older_stash_preserved(self):
         self.git("switch", "topic")
@@ -898,6 +905,119 @@ class FetchSignTests(unittest.TestCase):
         result = self.run_script(ok=False, remote="missing")
         self.assertIn("No such remote", result.stderr)
         self.assertEqual(self.git("for-each-ref", "refs/fetch-sign"), "")
+
+    def test_default_skips_dirty_target_without_fetching_or_stashing(self):
+        self.git("switch", "topic")
+        (self.local / "tracked").write_text("staged\n")
+        self.git("add", "tracked")
+        (self.local / "tracked").write_text("unstaged\n")
+        (self.local / "notes").write_text("untracked\n")
+        status = self.git("status", "--porcelain", "-z")
+        result = self.run_script(defaults=True)
+        self.assertIn("warning: skipping topic", result.stderr)
+        self.assertIn("--allow-dirty", result.stderr)
+        self.assertEqual(self.git("status", "--porcelain", "-z"), status)
+        self.assertEqual(self.git("rev-parse", "HEAD").strip(), self.previous)
+        self.assertEqual(self.git("for-each-ref", "refs/fetch-sign"), "")
+        self.assertEqual(self.git("stash", "list"), "")
+
+    def test_default_skips_unpushed_commits_despite_stale_tracking_ref(self):
+        self.git("switch", "topic")
+        self.git("update-ref", "refs/remotes/workstation/topic", self.previous)
+        result = self.run_script(defaults=True)
+        self.assertIn("warning: skipping topic", result.stderr)
+        self.assertIn("--allow-unpushed", result.stderr)
+        self.assertEqual(self.git("rev-parse", "HEAD").strip(), self.previous)
+        self.assertEqual(self.git("rev-parse", "topic", cwd=self.source).strip(), self.source_before)
+        self.assertEqual(self.git("for-each-ref", "refs/fetch-sign"), "")
+
+    def test_default_accepts_clean_local_tip_reachable_from_fresh_source(self):
+        self.git("switch", "topic")
+        self.git("reset", "--hard", self.base)
+        self.previous = self.base
+        self.run_script(defaults=True)
+        self.assert_signed_history()
+
+    def test_dirty_override_does_not_allow_unpushed_commits(self):
+        self.git("switch", "topic")
+        (self.local / "notes").write_text("keep\n")
+        result = self.run_script("--allow-dirty", defaults=True)
+        self.assertIn("--allow-unpushed", result.stderr)
+        self.assertEqual((self.local / "notes").read_text(), "keep\n")
+        self.assertEqual(self.git("stash", "list"), "")
+
+    def test_unpushed_override_does_not_allow_dirty_worktrees(self):
+        self.git("switch", "topic")
+        (self.local / "notes").write_text("keep\n")
+        result = self.run_script("--allow-unpushed", defaults=True)
+        self.assertIn("--allow-dirty", result.stderr)
+        self.assertEqual(self.git("rev-parse", "HEAD").strip(), self.previous)
+
+    def test_failed_push_restores_dirty_index_and_original_stash(self):
+        self.git("switch", "topic")
+        (self.local / "other").write_text("older stash\n")
+        self.git("stash", "push", "-m", "older")
+        older = self.git("rev-parse", "refs/stash")
+        (self.local / "tracked").write_text("staged\n")
+        self.git("add", "tracked")
+        (self.local / "tracked").write_text("unstaged\n")
+        (self.local / "notes").write_text("notes\n")
+        (self.local / "link").symlink_to("notes")
+        status = self.git("status", "--porcelain", "-z")
+        index = self.git("diff", "--cached", "--binary")
+        edits = self.git("diff", "--binary")
+        (self.source / "tracked").write_text("remote edit\n")
+        result = self.run_script(ok=False)
+        self.assertIn("local sync reverted", result.stderr)
+        self.assertEqual(self.git("rev-parse", "HEAD").strip(), self.previous)
+        self.assertEqual(self.git("status", "--porcelain", "-z"), status)
+        self.assertEqual(self.git("diff", "--cached", "--binary"), index)
+        self.assertEqual(self.git("diff", "--binary"), edits)
+        self.assertEqual((self.local / "notes").read_text(), "notes\n")
+        self.assertEqual(os.readlink(self.local / "link"), "notes")
+        self.assertEqual(self.git("rev-parse", "refs/stash"), older)
+
+    def test_failed_push_removes_only_new_worktree_and_restores_existing_branch(self):
+        path = self.root / "new-worktree"
+        (self.source / "tracked").write_text("remote edit\n")
+        result = self.run_script("topic", "--worktree", str(path), ok=False)
+        self.assertIn("local sync reverted", result.stderr)
+        self.assertFalse(path.exists())
+        self.assertEqual(self.git("rev-parse", "topic").strip(), self.previous)
+
+    def test_failed_push_removes_only_new_worktree_and_new_branch(self):
+        self.git("branch", "-D", "topic")
+        path = self.root / "new-worktree"
+        (self.source / "tracked").write_text("remote edit\n")
+        result = self.run_script("topic", "--worktree", str(path), ok=False)
+        self.assertIn("local sync reverted", result.stderr)
+        self.assertFalse(path.exists())
+        self.assertEqual(self.git("for-each-ref", "refs/heads/topic"), "")
+
+    def test_push_hook_concurrent_edit_prevents_destructive_rollback(self):
+        self.git("switch", "topic")
+        hook = self.local / ".git" / "hooks" / "pre-push"
+        hook.write_text(f"#!{sys.executable}\nfrom pathlib import Path\n"
+                        "Path('file').write_text('concurrent edit\\n')\nraise SystemExit(1)\n")
+        hook.chmod(0o755)
+        result = self.run_script(ok=False)
+        self.assertIn("recovery failed", result.stderr)
+        self.assertEqual((self.local / "file").read_text(), "concurrent edit\n")
+        self.assertIn(self.previous, self.git("for-each-ref", "refs/fetch-sign"))
+
+    def test_push_hook_concurrent_dirty_edit_retains_original_stash(self):
+        self.git("switch", "topic")
+        (self.local / "notes").write_text("before\n")
+        hook = self.local / ".git" / "hooks" / "pre-push"
+        hook.write_text(f"#!{sys.executable}\nfrom pathlib import Path\n"
+                        "Path('notes').write_text('concurrent edit\\n')\nraise SystemExit(1)\n")
+        hook.chmod(0o755)
+        result = self.run_script(ok=False)
+        self.assertIn("Worktree changed during push", result.stderr)
+        self.assertEqual((self.local / "notes").read_text(), "concurrent edit\n")
+        stash = self.git("rev-parse", "refs/stash").strip()
+        self.assertEqual(self.git("show", f"{stash}^3:notes"), "before\n")
+
 
 
 if __name__ == "__main__":

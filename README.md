@@ -95,6 +95,14 @@ force-with-lease tied to the exact fetched tip. `--remote NAME` is required;
 the utility does not assume a source machine or remote name.
 Use `--no-push` to keep the signed result local.
 
+By default, skip a dirty target worktree with a warning, including staged,
+unstaged, untracked, and submodule changes. Also skip when any local commit is
+absent from the freshly fetched source branch, even if cached tracking refs
+suggest otherwise. Skips exit successfully without replacing the branch.
+Use `--allow-dirty` to stash and restore local edits, and `--allow-unpushed`
+to deliberately replace unpushed or divergent local history. Each option
+overrides only its own check; recovery refs retain the old tip.
+
 Already signed topic commits are kept with their original IDs
 and signatures when their parents are unchanged. Adding an unsigned commit
 to a signed branch signs only the new commit, preserving normal fast-forward
@@ -108,9 +116,14 @@ that invocation only. This updates a checked-out remote branch and its
 worktree together, including linked worktrees, without detaching the worktree
 or changing remote configuration. Dirty remote worktrees refuse the push,
 preserving their edits. A changed remote tip also refuses the push. In either
-case, the signed local branch and recovery refs remain available.
+case, the local sync is rolled back by default. The previous tip, checkout,
+and original staged, unstaged, and untracked changes are restored. The fetched
+and signed commits remain available through recovery refs. Worktrees and
+branches created by this invocation are removed on failure if still clean and
+unchanged. Concurrent local commits or conflicting edits prevent automatic
+recovery; they are preserved and the recovery refs are reported.
 
-Local staged, unstaged, and untracked changes are automatically stashed just
+With `--allow-dirty`, local staged, unstaged, and untracked changes are stashed just
 before replacing the branch and restored afterward, including their staging
 state. Ignored files are excluded from the stash; existing stashes are preserved.
 If stash restoration conflicts, the utility reports Git's conflict details,
@@ -118,7 +131,7 @@ including affected paths, reverts the sync, and restores the
 original changes on the old branch tip, then exits with an error. If recovery
 also fails, it keeps the stash and prints a recovery ref. Unresolved conflicts
 and ongoing Git operations are refused. `--dry-run` leaves local changes in
-place without stashing them.
+place without stashing them (pass the same overrides to inspect a skipped worktree).
 
 ```sh
 cd /path/to/repository

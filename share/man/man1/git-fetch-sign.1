@@ -18,8 +18,16 @@ remote, using a lease on the exact fetched commit ID.
 The --remote argument is required; there is no default source remote.
 Use --no-push to keep the result local.
 Run from any worktree in the repository. If the branch is checked out in a
-linked worktree, that worktree is updated. Local staged, unstaged, and untracked
-changes are automatically stashed immediately before replacing the branch,
+linked worktree, that worktree is updated. By default, dirty worktrees are
+skipped with a warning, including staged, unstaged, untracked, and submodule
+changes. Local commits absent from the freshly fetched source branch also cause
+a warning and skip, including divergent history. Cached tracking refs are not
+used to establish that local work has been pushed. Skips exit successfully
+without replacing the branch. Use --allow-dirty and --allow-unpushed to override
+these checks independently.
+.PP
+With --allow-dirty, local staged, unstaged, and untracked changes are stashed
+immediately before replacing the branch,
 then restored with their staging state after the sync. Ignored files are not
 stashed. Worktrees with unresolved conflicts or an ongoing Git operation
 are refused.
@@ -109,8 +117,13 @@ Git updates a checked-out branch and its primary or linked worktree together,
 without detaching HEAD or changing remote configuration. A dirty remote
 index or worktree causes Git to refuse the push; remote edits are preserved.
 The lease also rejects a remote branch changed since the fetch.
-If pushing fails, the signed local branch and recovery refs are retained,
-and the utility exits with an error. A reverted local sync never pushes.
+If pushing fails, restore the previous local tip, checkout, and original
+staged, unstaged, and untracked changes by default, then exit with an error.
+Remove worktrees and branches created by this invocation only if they remain
+clean and unchanged. Concurrent local commits or conflicting edits prevent
+destructive recovery; preserve them and report the retained recovery refs.
+Fetched and signed commits remain reachable through recovery refs even after
+successful rollback. A reverted local sync never pushes.
 .SH OPTIONS
 .TP
 \fB\-\-pr\fR NUMBER|URL
@@ -129,6 +142,16 @@ its current path is accepted.
 \fB\-\-remote\fR NAME
 Required configured source remote. No default.
 The signed branch is pushed back to this remote after the local sync.
+.TP
+\fB\-\-allow-dirty\fR
+Stash and restore local edits instead of skipping a dirty target worktree.
+This does not permit replacing unpushed commits; use --allow-unpushed as well
+when both checks apply.
+.TP
+\fB\-\-allow-unpushed\fR
+Allow replacement of local commits absent from the freshly fetched source
+branch. The old tip remains in recovery refs. Dirty worktrees still require
+--allow-dirty.
 .TP
 \fB\-\-no-push\fR
 Keep the signed branch local without pushing it back to the source remote.
