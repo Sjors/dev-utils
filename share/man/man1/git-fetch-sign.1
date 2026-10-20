@@ -21,8 +21,15 @@ Run from any worktree in the repository. If the branch is checked out in a
 linked worktree, that worktree is updated. By default, dirty worktrees are
 skipped with a warning, including staged, unstaged, untracked, and submodule
 changes. Local commits absent from the freshly fetched source branch also cause
-a warning and skip, including divergent history. Cached tracking refs are not
-used to establish that local work has been pushed. Skips exit successfully
+a warning and skip, including divergent history, unless the local tip exactly
+matches the last successful push by this utility to this source and branch.
+This allows a remote rebase when the local branch has no new commits since
+the last sync. Store this acknowledgement in a local ref scoped to the remote
+name, URL, and branch. Dry runs, --no-push, and failed pushes do not update it.
+Runs made by older versions have no acknowledgement; after a remote rebase,
+check for new local work before using --allow-unpushed once.
+Cached tracking refs alone do not establish that local work has been pushed.
+Skips exit successfully
 without replacing the branch. Use --allow-dirty and --allow-unpushed to override
 these checks independently.
 .PP
