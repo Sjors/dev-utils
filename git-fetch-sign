@@ -27,7 +27,9 @@ def git(*args: str, cwd: str | None = None, data: bytes | None = None,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     )
     if check and result.returncode:
-        raise Error(result.stderr.decode(errors="replace").strip())
+        diagnostics = [output.decode(errors="replace").strip()
+                       for output in (result.stdout, result.stderr)]
+        raise Error("\n".join(message for message in diagnostics if message))
     return result.stdout
 
 
@@ -58,6 +60,62 @@ def fetch_upstream(spec: str | None) -> tuple[str, str]:
     tip = oid(ref)
     print(f"Fetched upstream {spec}: {tip}", flush=True)
     return ref, tip
+
+
+def fetch_stacked_base(source: str, upstream: str, source_remote: str) -> tuple[str, str] | None:
+    # A different author below our own commits suggests a stacked branch.
+    # Require a freshly advertised branch tip as evidence; authorship alone
+    # must never exclude a contributor's commit from the signing range.
+    history = git("log", "--first-parent", "--no-show-signature", "--format=%H%x00%ae", source,
+                  f"^{upstream}").splitlines()
+    if not history:
+        return None
+    identity = git("var", "GIT_AUTHOR_IDENT", check=False).strip()
+    match = re.fullmatch(rb".* <([^<>]*)> \d+ [+-]\d{4}", identity)
+    if not match:
+        return None
+    own_email = match[1].lower()
+    own_commits = False
+    candidate = None
+    for entry in history:
+        commit, email = entry.split(b"\0", 1)
+        if email.lower() != own_email:
+            if own_commits:
+                candidate = commit.decode()
+            break
+        own_commits = True
+    if candidate is None:
+        return None
+    remotes = git("remote").decode().splitlines()
+    # Cached refs can prioritize lookups, but never establish the base. Even a
+    # locally matching tip must be advertised by the remote before we use it.
+    hints = git("for-each-ref", "--format=%(refname)", "--points-at", candidate,
+                "refs/remotes").decode().splitlines()
+    remotes.sort(key=lambda r: not any(ref.startswith(f"refs/remotes/{r}/") for ref in hints))
+    for remote in remotes:
+        if remote == source_remote:
+            continue
+        try:
+            advertised = git("ls-remote", "--heads", "--", remote).decode().splitlines()
+        except Error as exc:
+            print(f"Could not check stacked base on {remote}: {exc}", file=sys.stderr, flush=True)
+            continue
+        for entry in advertised:
+            tip, branch = entry.split()
+            if tip != candidate:
+                continue
+            name = branch.removeprefix("refs/heads/")
+            ref = f"refs/remotes/{remote}/{name}"
+            git("fetch", "--no-tags", "--no-recurse-submodules", "--", remote,
+                f"+{branch}:{ref}")
+            fetched = oid(ref)
+            # Allow a fast-forward since advertisement, but never silently
+            # accept a different history after a racing force push.
+            if git("merge-base", candidate, fetched, check=False).decode().strip() != candidate:
+                raise Error(f"Stacked base changed on {remote}/{name}; retry or pass --base REF")
+            print(f"Protected stacked base {remote}/{name}: {candidate}", flush=True)
+            return f"{remote}/{name}", candidate
+    return None
 
 
 def pr_branch(pr: str, repo: str | None) -> str:
@@ -262,6 +320,12 @@ def unsigned(raw: bytes) -> bytes:
 def sign_commit(old: str, rewritten: dict[str, str]) -> str:
     raw = git("cat-file", "commit", old)
     fields, message = commit_parts(raw)
+    if any(f.split(b" ", 1)[0] in (b"gpgsig", b"gpgsig-sha256") for f in fields):
+        # Keep existing signatures and IDs when their payload is unchanged.
+        # Only verify signatures created by this utility.
+        parents = [f.split(b" ", 1)[1].decode() for f in fields if f.startswith(b"parent ")]
+        if all(rewritten.get(parent, parent) == parent for parent in parents):
+            return old
     env = os.environ.copy()
     args: list[str] = []
     expected: list[bytes] = []
@@ -315,7 +379,7 @@ def main() -> None:
     parser.add_argument("--worktree", type=Path, help="Create the missing worktree at PATH (default: mirror SSH remote path)")
     parser.add_argument("--remote", required=True, help="Configured remote to fetch from and push back to")
     parser.add_argument("--upstream", help="Upstream branch to fetch and protect (default: origin/master, or origin/main)")
-    parser.add_argument("--base", help="Additional base ref to exclude for stacked branches")
+    parser.add_argument("--base", help="Stacked base ref to exclude (default: detect a published parent branch)")
     parser.add_argument("--no-push", action="store_true", help="Keep the signed branch local instead of pushing it back")
     parser.add_argument("--dry-run", action="store_true", help="Fetch and show commits without signing, syncing, or pushing")
     args = parser.parse_args()
@@ -363,6 +427,10 @@ def main() -> None:
     source = oid(f"{backup}/source")
     if not git("merge-base", "--all", upstream_tip, source, check=False).strip():
         raise Error("Fetched branch and upstream have no shared history; local branch left unchanged")
+    if args.base is None:
+        inferred = fetch_stacked_base(source, upstream_tip, args.remote)
+        if inferred is not None:
+            base_ref, base_tip = inferred
     # Exclude the whole upstream history, including commits brought in through
     # merge parents. A merge-base cutoff can incorrectly include those commits.
     commits = git("rev-list", "--reverse", "--topo-order", source,
@@ -370,7 +438,7 @@ def main() -> None:
     print(f"Fetched {args.remote}/{args.branch}: {source}", flush=True)
     print(f"Protected upstream: {upstream_ref}; base: {base_ref}; {len(commits)} commit(s)", flush=True)
     for commit in commits:
-        subject = git("show", "-s", "--format=%s", commit).decode(errors="replace").strip()
+        subject = git("show", "-s", "--no-show-signature", "--format=%s", commit).decode(errors="replace").strip()
         print(f"  {commit[:12]} {subject}", flush=True)
     if checkout is None:
         print(f"Will create worktree: {new_worktree}", flush=True)
@@ -383,7 +451,8 @@ def main() -> None:
     rewritten: dict[str, str] = {}
     for i, commit in enumerate(commits, 1):
         rewritten[commit] = sign_commit(commit, rewritten)
-        print(f"Signed {i}/{len(commits)}: {rewritten[commit]}", flush=True)
+        action = "Kept signed commit" if rewritten[commit] == commit else "Signed"
+        print(f"{action} {i}/{len(commits)}: {rewritten[commit]}", flush=True)
     signed = rewritten.get(source, source)
     git("update-ref", f"{backup}/signed", signed, "")
     # Recheck just before touching the branch; never discard working tree edits.
@@ -393,7 +462,7 @@ def main() -> None:
     if checkout:
         sync_worktree(checkout, ref, previous, signed, backup)
     else:
-        # Create only after every signature has been verified. Do not force an
+        # Create only after all commits pass signing checks. Do not force an
         # existing directory or branch checked out by another worktree.
         if previous:
             git("worktree", "add", "--", new_worktree, args.branch)

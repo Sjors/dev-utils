@@ -88,12 +88,20 @@ git range-diff-remote --help            # full usage (man page)
 Fetch a topic branch from an explicitly selected Git remote, sign its commits
 with your local Git signing key, and replace the same local branch. Run from
 any worktree; the utility finds and updates the branch's own worktree. It preserves
-commit contents, metadata, dates, and merge topology, verifies every signature,
+commit contents, metadata, dates, and merge topology, verifies every new signature,
 and keeps recovery refs for the fetched and previous local tips. After a
 successful local sync, it pushes the signed branch back to that remote using a
 force-with-lease tied to the exact fetched tip. `--remote NAME` is required;
 the utility does not assume a source machine or remote name.
 Use `--no-push` to keep the signed result local.
+
+Already signed topic commits are kept with their original IDs
+and signatures when their parents are unchanged. Adding an unsigned commit
+to a signed branch signs only the new commit, preserving normal fast-forward
+ancestry with the published branch. Repeated syncs leave the signed history
+unchanged. Existing signatures are not verified, so contributor public keys
+are not required. A rewritten parent requires re-signing its descendants.
+Only signatures created by this utility are verified.
 
 For SSH and local transports, the push uses Git's `updateInstead` mode for
 that invocation only. This updates a checked-out remote branch and its
@@ -105,7 +113,8 @@ case, the signed local branch and recovery refs remain available.
 Local staged, unstaged, and untracked changes are automatically stashed just
 before replacing the branch and restored afterward, including their staging
 state. Ignored files are excluded from the stash; existing stashes are preserved.
-If stash restoration conflicts, the utility reverts the sync and restores the
+If stash restoration conflicts, the utility reports Git's conflict details,
+including affected paths, reverts the sync, and restores the
 original changes on the old branch tip, then exits with an error. If recovery
 also fails, it keeps the stash and prints a recovery ref. Unresolved conflicts
 and ongoing Git operations are refused. `--dry-run` leaves local changes in
@@ -148,8 +157,19 @@ keep their original IDs and signatures, including upstream commits merged into
 the topic branch. This works even with a stale `origin/HEAD` or a missing local
 upstream tracking ref. An upstream fetch failure stops the sync.
 
-`--upstream REMOTE/BRANCH` selects a different upstream. `--base REF` additionally
-excludes a stacked parent branch's history; it cannot disable upstream protection.
+For stacked branches, the utility looks for the nearest other-author commit
+below your own commits on the first-parent history. Your identity comes from
+Git's current author email. It checks the branch tips currently advertised by
+configured remotes other than the source remote. If a tip matches that commit
+exactly, it fetches that branch and protects the parent history from signing.
+Local tracking refs may be missing or stale. Authorship alone never excludes
+commits, and this detection does not repair previously rewritten parent commits.
+
+`--upstream REMOTE/BRANCH` selects a different upstream. `--base REF` overrides
+stack detection and additionally excludes that local ref's history; it cannot
+disable upstream protection. Use it for unpublished parents, parents whose
+remote branch has moved, or stacks using a different author email. To explicitly
+sign the entire topic range, pass the upstream tracking ref as `--base`.
 `--remote` selects the source remote. A branch containing only upstream
 commits is synced without recreating them. Signing topic commits changes their
 IDs. The automatic push goes back to the selected source remote.

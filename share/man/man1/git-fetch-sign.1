@@ -1,4 +1,4 @@
-.TH GIT-FETCH-SIGN "1" "October 15, 2026" "git-fetch-sign" "User Commands"
+.TH GIT-FETCH-SIGN "1" "October 20, 2026" "git-fetch-sign" "User Commands"
 .SH NAME
 git-fetch-sign \- fetch a remote topic branch and sign its commits locally
 .SH SYNOPSIS
@@ -10,8 +10,8 @@ git-fetch-sign \- fetch a remote topic branch and sign its commits locally
 [\fB\-\-repo\fR OWNER/REPO]
 [\fB\-\-worktree\fR PATH] [OPTIONS]
 .SH DESCRIPTION
-Fetch BRANCH from the configured remote selected by --remote, recreate its
-topic commits with local Git signatures, verify them, then replace the same
+Fetch BRANCH from the configured remote selected by --remote, sign its
+unsigned topic commits, verify them, then replace the same
 local branch.
 After the local sync succeeds, force-push the signed tip back to the source
 remote, using a lease on the exact fetched commit ID.
@@ -25,7 +25,8 @@ stashed. Worktrees with unresolved conflicts or an ongoing Git operation
 are refused.
 Other worktrees are untouched.
 .PP
-If restoring the stash fails, the sync is reverted to the previous local tip
+If restoring the stash fails, Git's conflict details, including affected paths,
+are reported. The sync is reverted to the previous local tip
 and the stash is reapplied there. A reverted sync exits with an error even
 when the original changes were restored successfully. Existing stashes are
 preserved. If recovery also fails, the saved stash is retained and its recovery
@@ -67,12 +68,36 @@ The explicit base ref is read locally. If the fetched branch is entirely
 upstream history, it is synced without recreating or signing any commits.
 An upstream fetch failure prevents signing and branch replacement.
 .PP
-Every selected topic commit, including merge and empty commits, is signed using
-Git's configured signing key and program. Commit trees, messages, author and
+Without --base, look for the nearest other-author commit below your own
+commits on the first-parent history, using Git's current author email as your
+identity. Check the branch tips currently advertised by configured remotes,
+excluding the source remote. If a branch tip exactly matches that commit,
+fetch it and protect the parent history from signing. Local tracking refs
+may be missing or stale. Authorship alone never excludes commits. This cannot
+repair parent commits that have already been rewritten.
+.PP
+Use --base REF to override detection for unpublished parents, parents whose
+remote branch has moved, or stacks using another author email. Passing the
+upstream tracking ref explicitly signs the entire topic range. Unavailable
+remotes are reported and skipped during detection; if no branch tip matches,
+the signing range excludes only upstream history.
+.PP
+Existing signed topic commits are kept byte-for-byte, including
+their IDs and signatures, when their parents are unchanged. Adding a new
+unsigned commit to a signed branch signs only that new commit, retaining
+fast-forward ancestry with the published branch. Repeated syncs do not
+re-sign the existing history. Existing signatures are not verified, so
+contributor public keys are not required. Only signatures created by this
+utility are verified.
+.PP
+Unsigned topic commits, including merge and empty commits, are signed using
+Git's configured signing key and program. If a parent is rewritten, descendants
+must also be recreated and signed because their signed payload changes.
+Commit trees, messages, author and
 committer identities, dates, and parent ordering are preserved.
 Topic parent IDs are replaced with their signed equivalents.
-Existing signatures are replaced.
-Unsupported extra commit headers (for example mergetag) cause an error.
+Unsupported extra commit headers (for example mergetag) cause an error when
+a commit needs to be recreated.
 .PP
 Signing changes commit IDs. The local branch is replaced only after all new
 commits pass signature and metadata verification. Signing failures leave the
@@ -114,19 +139,20 @@ origin/main only when master does not exist on origin.
 .TP
 \fB\-\-base\fR REF
 Additional local ref whose reachable commits are excluded from signing.
-Select the parent branch for stacked work. Upstream history is always excluded.
+Overrides automatic detection of a published stacked parent branch.
+Upstream history is always excluded; the explicit ref is read locally.
 .TP
 \fB\-\-dry-run\fR
 Fetch and list the signing range without signing, replacing the local branch,
 creating a worktree, stashing local changes, or pushing.
-Upstream tracking refs, fetched objects, and FETCH_HEAD may change;
+Upstream and stacked-parent tracking refs, fetched objects, and FETCH_HEAD may change;
 the temporary source ref is removed.
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Display usage.
 .SH RECOVERY
 Runs retain refs under refs/fetch-sign/TIMESTAMP-ID/: source is the fetched tip,
-previous is the old local tip (if it existed), and signed is the verified new
+previous is the old local tip (if it existed), and signed is the resulting new
 tip (once signing completes). A stash ref is also retained if stashed changes
 could not be restored. The namespace is printed. These refs keep commits
 reachable and can be used with git log, git diff, and git reset.

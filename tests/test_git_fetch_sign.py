@@ -29,6 +29,18 @@ class FetchSignTests(unittest.TestCase):
                        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if result.returncode:
             raise RuntimeError(result.stderr.decode())
+        cls.contributor_keys = tempfile.TemporaryDirectory(prefix="fetch-sign-contributor-")
+        cls.addClassCleanup(cls.contributor_keys.cleanup)
+        os.chmod(cls.contributor_keys.name, 0o700)
+        cls.contributor_env = {**cls.env, "GNUPGHOME": cls.contributor_keys.name}
+        cls.addClassCleanup(subprocess.run, ["gpgconf", "--kill", "gpg-agent"],
+                            env=cls.contributor_env, check=False)
+        result = subprocess.run(["gpg", "--batch", "--pinentry-mode", "loopback", "--passphrase", "",
+                        "--quick-generate-key", "Contributor <contributor@example.com>",
+                        "ed25519", "sign", "0"], env=cls.contributor_env,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if result.returncode:
+            raise RuntimeError(result.stderr.decode())
 
     @classmethod
     def tearDownClass(cls):
@@ -62,9 +74,9 @@ class FetchSignTests(unittest.TestCase):
         self.git("commit", "-m", "remote commit\n\nA multiline message.", cwd=self.source)
         self.git("commit", "--allow-empty", "-m", "empty commit", cwd=self.source)
 
-    def git(self, *args, cwd=None):
+    def git(self, *args, cwd=None, env=None):
         return subprocess.check_output(["git", *args], cwd=cwd or self.local,
-                                       env=self.env, stderr=subprocess.PIPE).decode()
+                                       env=env or self.env, stderr=subprocess.PIPE).decode()
 
     def configure(self, path):
         for key, value in (("user.name", "Test"), ("user.email", "test@example.com"),
@@ -165,6 +177,125 @@ class FetchSignTests(unittest.TestCase):
         self.run_script("topic")
         self.assert_signed_history()
 
+    def sign_source_topic(self, contributor=False):
+        # Sign only the two topic commits; retain the upstream base unchanged.
+        env = self.contributor_env if contributor else self.env
+        key = "contributor@example.com" if contributor else "test@example.com"
+        self.git("-c", "core.editor=true", "-c", f"user.signingkey={key}",
+                 "rebase", "--force-rebase", "--gpg-sign", "main", cwd=self.source,
+                 env={**env, "GIT_SEQUENCE_EDITOR": "true", "GIT_EDITOR": "true"})
+        return self.git("rev-parse", "topic", cwd=self.source).strip()
+
+    def test_missing_contributor_key_keeps_signed_history(self):
+        signed = self.sign_source_topic(contributor=True)
+        self.git("switch", "topic")
+        self.git("config", "user.signingkey", "missing-signing-key")
+        result = self.run_script()
+        self.assertIn("Kept signed commit 2/2", result.stdout)
+        self.assertNotIn("\nSigned ", result.stdout)
+        self.assertEqual(self.git("rev-parse", "topic").strip(), signed)
+        self.assertEqual(self.git("rev-parse", "topic", cwd=self.source).strip(), signed)
+
+    def test_log_configuration_does_not_verify_existing_signatures(self):
+        signed = self.sign_source_topic(contributor=True)
+        self.git("switch", "topic")
+        marker = self.root / "gpg-invoked"
+        wrapper = self.root / "gpg-fail"
+        wrapper.write_text(
+            f"#!{sys.executable}\n"
+            "import pathlib, sys\n"
+            f"pathlib.Path({str(marker)!r}).touch()\n"
+            "sys.exit(1)\n"
+        )
+        wrapper.chmod(0o755)
+        self.git("config", "gpg.program", str(wrapper))
+        self.git("config", "log.showSignature", "true")
+        self.run_script()
+        self.assertFalse(marker.exists(), "Existing signatures were verified")
+        self.assertEqual(self.git("rev-parse", "topic").strip(), signed)
+
+    def test_unsigned_append_keeps_unknown_contributor_signature(self):
+        signed = self.sign_source_topic(contributor=True)
+        self.git("commit", "--allow-empty", "-m", "new unsigned commit", cwd=self.source)
+        self.git("switch", "topic")
+        result = self.run_script()
+        self.assertIn("Kept signed commit 2/3", result.stdout)
+        self.assertIn("Signed 3/3", result.stdout)
+        self.assertEqual(self.git("rev-parse", "topic^").strip(), signed)
+        self.git("verify-commit", "topic")
+        self.assertEqual(self.git("rev-parse", "topic", cwd=self.source),
+                         self.git("rev-parse", "topic"))
+
+    def test_signed_payload_resigned_without_contributor_key(self):
+        self.git("-c", "user.signingkey=contributor@example.com", "commit", "--amend",
+                 "--allow-empty", "--no-edit", "-S", cwd=self.source, env=self.contributor_env)
+        signed = self.git("rev-parse", "topic", cwd=self.source).strip()
+        self.git("switch", "topic")
+        result = self.run_script()
+        self.assertIn("Signed 1/2", result.stdout)
+        self.assertIn("Signed 2/2", result.stdout)
+        self.assertNotEqual(self.git("rev-parse", "topic").strip(), signed)
+        self.assert_signed_history()
+
+    def test_already_signed_history_kept_without_signing_key(self):
+        signed = self.sign_source_topic()
+        self.git("switch", "topic")
+        self.git("config", "user.signingkey", "missing-signing-key")
+        result = self.run_script()
+        self.assertIn("Kept signed commit 2/2", result.stdout)
+        self.assertNotIn("\nSigned ", result.stdout)
+        self.assertEqual(self.git("rev-parse", "topic").strip(), signed)
+        self.assert_signed_history()
+
+    def test_new_commit_keeps_signed_prefix_and_fast_forward_ancestry(self):
+        published = self.sign_source_topic()
+        self.git("fetch", "origin", "refs/heads/topic:refs/remotes/origin/topic")
+        self.git("commit", "--allow-empty", "-m", "new unsigned commit", cwd=self.source)
+        self.git("switch", "topic")
+        result = self.run_script()
+        self.assertIn("Kept signed commit 2/3", result.stdout)
+        self.assertIn("Signed 3/3", result.stdout)
+        self.assertEqual(self.git("rev-parse", "topic^").strip(), published)
+        self.git("merge-base", "--is-ancestor", "origin/topic", "topic")
+        self.assertEqual(self.git("rev-list", "--count", "origin/topic..topic").strip(), "1")
+        self.assert_signed_history()
+
+    def test_repeated_sync_does_not_rewrite_signed_history(self):
+        self.git("switch", "topic")
+        self.run_script()
+        first = self.git("rev-parse", "topic").strip()
+        self.git("config", "user.signingkey", "missing-signing-key")
+        self.run_script()
+        self.assertEqual(self.git("rev-parse", "topic").strip(), first)
+        self.assert_signed_history()
+
+    def test_signed_descendant_is_resigned_when_unsigned_parent_changes(self):
+        self.git("commit", "--amend", "--allow-empty", "--no-edit", "-S", cwd=self.source)
+        signed = self.git("rev-parse", "topic", cwd=self.source).strip()
+        self.git("switch", "topic")
+        result = self.run_script()
+        self.assertIn("Signed 1/2", result.stdout)
+        self.assertIn("Signed 2/2", result.stdout)
+        self.assertNotEqual(self.git("rev-parse", "topic").strip(), signed)
+        self.assert_signed_history()
+
+    def test_invalid_existing_signature_kept_without_verification(self):
+        signed = self.sign_source_topic()
+        raw = self.git("cat-file", "commit", signed, cwd=self.source).encode()
+        raw = raw.replace(b"empty commit", b"tampered message")
+        tampered = subprocess.check_output(["git", "hash-object", "-w", "-t", "commit", "--stdin"],
+                                          input=raw, cwd=self.source, env=self.env).decode().strip()
+        self.git("reset", "--hard", tampered, cwd=self.source)
+        self.git("commit", "--allow-empty", "-m", "new unsigned commit", cwd=self.source)
+        self.git("switch", "topic")
+        result = self.run_script()
+        self.assertIn("Kept signed commit 2/3", result.stdout)
+        self.assertIn("Signed 3/3", result.stdout)
+        self.assertEqual(self.git("rev-parse", "topic^").strip(), tampered)
+        self.git("verify-commit", "topic")
+        self.assertEqual(self.git("rev-parse", "topic", cwd=self.source),
+                         self.git("rev-parse", "topic"))
+
     def upstream_master_merge(self):
         # Switch the upstream default from main to master after the clone, so
         # origin/HEAD is stale and origin/master is initially missing locally.
@@ -208,6 +339,121 @@ class FetchSignTests(unittest.TestCase):
         self.git("update-ref", "refs/remotes/origin/master", self.base)
         self.run_script("--base", self.base)
         self.assert_upstream_preserved(upstream)
+
+    def published_stack(self):
+        self.git("reset", "--hard", "main", cwd=self.source)
+        (self.source / "file").write_text("contributor content\n")
+        self.git("add", "file", cwd=self.source)
+        for subject in ("contributor change", "contributor follow-up"):
+            self.git("-c", "user.name=Contributor", "-c", "user.email=contributor@example.com",
+                     "commit", "--allow-empty", "-m", subject, cwd=self.source)
+        parent = self.git("rev-parse", "HEAD", cwd=self.source).strip()
+        publisher = self.root / "publisher"
+        self.git("clone", "--bare", str(self.source), str(publisher), cwd=self.root)
+        self.git("branch", "-m", "topic", "parent", cwd=publisher)
+        self.git("remote", "add", "contributor", str(publisher))
+        self.git("commit", "--allow-empty", "-m", "my stacked change", cwd=self.source)
+        self.git("switch", "topic")
+        return parent, publisher
+
+    def assert_stack_preserved(self, parent):
+        self.assertEqual(self.git("rev-parse", "topic^").strip(), parent)
+        self.assertEqual(self.git("rev-parse", "contributor/parent").strip(), parent)
+        self.assertEqual(self.git("show", "-s", "--format=%G?", parent).strip(), "N")
+        self.git("verify-commit", "topic")
+        self.assertEqual(self.git("rev-parse", "topic^{tree}").strip(),
+                         self.git("rev-parse", "topic^{tree}", cwd=self.source).strip())
+
+    def test_detects_published_stack_without_local_parent_ref(self):
+        parent, _ = self.published_stack()
+        self.assertNotIn("contributor/parent", self.git("branch", "-r"))
+        result = self.run_script()
+        self.assertIn(f"Protected stacked base contributor/parent: {parent}", result.stdout)
+        self.assertIn("1 commit(s)", result.stdout)
+        self.assert_stack_preserved(parent)
+
+    def test_refreshes_stale_stacked_parent_ref(self):
+        parent, _ = self.published_stack()
+        self.git("update-ref", "refs/remotes/contributor/parent", self.base)
+        self.run_script()
+        self.assert_stack_preserved(parent)
+
+    def test_stale_local_tip_alone_does_not_protect_a_stack(self):
+        parent, publisher = self.published_stack()
+        self.git("fetch", "contributor", "refs/heads/parent:refs/remotes/contributor/parent")
+        self.git("update-ref", "refs/heads/parent", self.base, cwd=publisher)
+        result = self.run_script()
+        self.assertNotIn("Protected stacked base", result.stdout)
+        self.assertIn("3 commit(s)", result.stdout)
+        self.assert_signed_history()
+
+    def test_foreign_author_without_published_branch_is_signed(self):
+        _, publisher = self.published_stack()
+        self.git("update-ref", "-d", "refs/heads/parent", cwd=publisher)
+        result = self.run_script()
+        self.assertNotIn("Protected stacked base", result.stdout)
+        self.assertIn("3 commit(s)", result.stdout)
+        self.assert_signed_history()
+
+    def test_explicit_base_disables_stack_detection(self):
+        self.published_stack()
+        result = self.run_script("--base", self.base)
+        self.assertNotIn("Protected stacked base", result.stdout)
+        self.assertIn("3 commit(s)", result.stdout)
+        self.assert_signed_history()
+
+    def test_stacked_dry_run_fetches_parent_without_signing(self):
+        parent, _ = self.published_stack()
+        source = self.git("rev-parse", "topic", cwd=self.source)
+        result = self.run_script("--dry-run")
+        self.assertIn("1 commit(s)", result.stdout)
+        self.assertEqual(self.git("rev-parse", "contributor/parent").strip(), parent)
+        self.assertEqual(self.git("rev-parse", "topic").strip(), self.previous)
+        self.assertEqual(self.git("rev-parse", "topic", cwd=self.source), source)
+
+    def test_other_authors_branch_without_own_commits_is_not_excluded(self):
+        parent, _ = self.published_stack()
+        self.git("reset", "--hard", parent, cwd=self.source)
+        result = self.run_script()
+        self.assertNotIn("Protected stacked base", result.stdout)
+        self.assertIn("2 commit(s)", result.stdout)
+        self.assert_signed_history()
+
+    def race_parent_fetch(self, publisher, replacement):
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir()
+        real_git = shutil.which("git")
+        wrapper = bin_dir / "git"
+        wrapper.write_text(
+            f"#!{sys.executable}\n"
+            "import os, subprocess, sys\n"
+            "if 'fetch' in sys.argv and 'contributor' in sys.argv:\n"
+            f"    subprocess.run([{real_git!r}, '-C', {str(publisher)!r}, 'update-ref',\n"
+            f"                    'refs/heads/parent', {replacement!r}], check=True)\n"
+            f"os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])\n"
+        )
+        wrapper.chmod(0o755)
+        self.env["PATH"] = str(bin_dir) + os.pathsep + self.env["PATH"]
+
+    def test_racing_parent_rewrite_refuses_sync(self):
+        _, publisher = self.published_stack()
+        source = self.git("rev-parse", "topic", cwd=self.source)
+        self.race_parent_fetch(publisher, self.base)
+        result = self.run_script(ok=False)
+        self.assertIn("Stacked base changed", result.stderr)
+        self.assertEqual(self.git("rev-parse", "topic").strip(), self.previous)
+        self.assertEqual(self.git("rev-parse", "topic", cwd=self.source), source)
+
+    def test_racing_parent_fast_forward_still_signs_own_commit(self):
+        parent, publisher = self.published_stack()
+        advanced = self.git("rev-parse", "topic", cwd=self.source).strip()
+        self.git("fetch", str(self.source), "topic:refs/heads/advanced", cwd=publisher)
+        self.race_parent_fetch(publisher, advanced)
+        result = self.run_script()
+        self.assertIn("1 commit(s)", result.stdout)
+        self.assertEqual(self.git("rev-parse", "contributor/parent").strip(), advanced)
+        self.assertEqual(self.git("rev-parse", "topic^").strip(), parent)
+        self.git("verify-commit", "topic")
 
     def test_mainline_only_branch_synced_without_signing(self):
         self.git("switch", "main")
@@ -340,6 +586,7 @@ class FetchSignTests(unittest.TestCase):
         index = self.git("diff", "--cached", "--binary")
         edits = self.git("diff", "--binary")
         result = self.run_script("topic", ok=False)
+        self.assertIn("Merge conflict in tracked", result.stderr)
         self.assertIn("sync reverted and original worktree changes restored", result.stderr)
         self.assertEqual(self.git("rev-parse", "topic").strip(), self.previous)
         self.assertEqual(self.git("status", "--porcelain", "-z"), status)
