@@ -76,19 +76,27 @@ The explicit base ref is read locally. If the fetched branch is entirely
 upstream history, it is synced without recreating or signing any commits.
 An upstream fetch failure prevents signing and branch replacement.
 .PP
-Without --base, look for the nearest other-author commit below your own
+Without --base, protect the most recent first-parent merge that brings in
+commits outside the fetched upstream history, together with all its ancestors.
+Only commits above this dependency merge are considered for signing. The merge
+itself and imported dependencies retain their original IDs and signatures.
+Merges of upstream alone do not establish this boundary; earlier topic commits
+still need signing.
+.PP
+Also look for the nearest other-author commit below your own
 commits on the first-parent history, using Git's current author email as your
 identity. Check the branch tips currently advertised by configured remotes,
 excluding the source remote. If a branch tip exactly matches that commit,
 fetch it and protect the parent history from signing. Local tracking refs
-may be missing or stale. Authorship alone never excludes commits. This cannot
-repair parent commits that have already been rewritten.
+may be missing or stale. If a dependency merge was detected, limit this search
+to commits above it. Authorship alone never excludes commits. Neither detection
+repairs parent commits that have already been rewritten.
 .PP
-Use --base REF to override detection for unpublished parents, parents whose
+Use --base REF to override both detections for unpublished parents, parents whose
 remote branch has moved, or stacks using another author email. Passing the
 upstream tracking ref explicitly signs the entire topic range. Unavailable
 remotes are reported and skipped during detection; if no branch tip matches,
-the signing range excludes only upstream history.
+the signing range excludes upstream history and any detected dependency merge.
 .PP
 Existing signed topic commits are kept byte-for-byte, including
 their IDs and signatures, when their parents are unchanged. Adding a new
@@ -162,7 +170,7 @@ origin/main only when master does not exist on origin.
 .TP
 \fB\-\-base\fR REF
 Additional local ref whose reachable commits are excluded from signing.
-Overrides automatic detection of a published stacked parent branch.
+Overrides automatic detection of dependency merges and published parent branches.
 Upstream history is always excluded; the explicit ref is read locally.
 .TP
 \fB\-\-dry-run\fR

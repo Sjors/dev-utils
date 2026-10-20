@@ -170,19 +170,27 @@ keep their original IDs and signatures, including upstream commits merged into
 the topic branch. This works even with a stale `origin/HEAD` or a missing local
 upstream tracking ref. An upstream fetch failure stops the sync.
 
+For branches assembled by merging dependencies, the most recent merge on the
+first-parent history that brings in non-upstream commits is protected along
+with all its ancestors. Only commits above that merge are considered for
+signing. The dependency commits and the merge itself retain their original
+IDs and signatures. Merges of upstream alone do not establish this boundary;
+earlier topic commits still need signing.
+
 For stacked branches, the utility looks for the nearest other-author commit
 below your own commits on the first-parent history. Your identity comes from
 Git's current author email. It checks the branch tips currently advertised by
 configured remotes other than the source remote. If a tip matches that commit
 exactly, it fetches that branch and protects the parent history from signing.
 Local tracking refs may be missing or stale. Authorship alone never excludes
-commits, and this detection does not repair previously rewritten parent commits.
+commits. When a dependency merge was detected, this search is limited to
+commits above it. Neither detection repairs previously rewritten parent commits.
 
 `--upstream REMOTE/BRANCH` selects a different upstream. `--base REF` overrides
-stack detection and additionally excludes that local ref's history; it cannot
-disable upstream protection. Use it for unpublished parents, parents whose
-remote branch has moved, or stacks using a different author email. To explicitly
-sign the entire topic range, pass the upstream tracking ref as `--base`.
+both automatic base detections and additionally excludes that local ref's
+history; it cannot disable upstream protection. Use it for unpublished parents,
+parents whose remote branch has moved, or stacks using a different author email.
+To explicitly sign the entire topic range, pass the upstream tracking ref as `--base`.
 `--remote` selects the source remote. A branch containing only upstream
 commits is synced without recreating them. Signing topic commits changes their
 IDs. The automatic push goes back to the selected source remote.

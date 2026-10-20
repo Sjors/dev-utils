@@ -63,12 +63,27 @@ def fetch_upstream(spec: str | None) -> tuple[str, str]:
     return ref, tip
 
 
-def fetch_stacked_base(source: str, upstream: str, source_remote: str) -> tuple[str, str] | None:
+def merged_dependency_base(source: str, upstream: str) -> str | None:
+    # Branches assembled from dependency PRs keep the assembled history intact.
+    # A merge of upstream alone is different: our earlier topic commits still
+    # need signing, while upstream is already protected independently.
+    merges = git("rev-list", "--first-parent", "--merges", source,
+                 f"^{upstream}").decode().splitlines()
+    for merge in merges:
+        fields, _ = commit_parts(git("cat-file", "commit", merge))
+        parents = [field.split(b" ", 1)[1].decode()
+                   for field in fields if field.startswith(b"parent ")]
+        if git("rev-list", "-1", *parents[1:], f"^{upstream}").strip():
+            return merge
+    return None
+
+
+def fetch_stacked_base(source: str, protected_base: str, source_remote: str) -> tuple[str, str] | None:
     # A different author below our own commits suggests a stacked branch.
     # Require a freshly advertised branch tip as evidence; authorship alone
     # must never exclude a contributor's commit from the signing range.
     history = git("log", "--first-parent", "--no-show-signature", "--format=%H%x00%ae", source,
-                  f"^{upstream}").splitlines()
+                  f"^{protected_base}").splitlines()
     if not history:
         return None
     identity = git("var", "GIT_AUTHOR_IDENT", check=False).strip()
@@ -423,7 +438,7 @@ def main() -> None:
     parser.add_argument("--worktree", type=Path, help="Create the missing worktree at PATH (default: mirror SSH remote path)")
     parser.add_argument("--remote", required=True, help="Configured remote to fetch from and push back to")
     parser.add_argument("--upstream", help="Upstream branch to fetch and protect (default: origin/master, or origin/main)")
-    parser.add_argument("--base", help="Stacked base ref to exclude (default: detect a published parent branch)")
+    parser.add_argument("--base", help="Base ref to exclude (default: detect dependency merges and published parents)")
     parser.add_argument("--allow-dirty", action="store_true", help="Stash and restore local edits instead of skipping dirty worktrees")
     parser.add_argument("--allow-unpushed", action="store_true", help="Allow replacement of local commits absent from the freshly fetched source branch")
     parser.add_argument("--no-push", action="store_true", help="Keep the signed branch local instead of pushing it back")
@@ -482,7 +497,11 @@ def main() -> None:
     if not git("merge-base", "--all", upstream_tip, source, check=False).strip():
         raise Error("Fetched branch and upstream have no shared history; local branch left unchanged")
     if args.base is None:
-        inferred = fetch_stacked_base(source, upstream_tip, args.remote)
+        merged_base = merged_dependency_base(source, upstream_tip)
+        if merged_base is not None:
+            base_ref, base_tip = f"merge {merged_base}", merged_base
+            print(f"Protected merged dependencies through {merged_base}", flush=True)
+        inferred = fetch_stacked_base(source, base_tip, args.remote)
         if inferred is not None:
             base_ref, base_tip = inferred
     # Exclude the whole upstream history, including commits brought in through

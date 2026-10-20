@@ -171,14 +171,93 @@ class FetchSignTests(unittest.TestCase):
         self.assertEqual((self.local / "unrelated").read_text(), "leave this alone")
         self.assertEqual(self.git("status", "--porcelain", cwd=linked), "")
 
-    def test_merge_topology(self):
+    def test_merge_topology_with_explicit_base(self):
         self.git("switch", "topic")
         self.git("switch", "-c", "side", self.base, cwd=self.source)
         self.git("commit", "--allow-empty", "-m", "side commit", cwd=self.source)
         self.git("switch", "topic", cwd=self.source)
         self.git("merge", "--no-ff", "side", "-m", "merge side", cwd=self.source)
-        self.run_script("topic")
+        self.run_script("topic", "--base", self.base)
         self.assert_signed_history()
+
+    def dependency_merges(self):
+        for name in ("dependency-one", "dependency-two"):
+            self.git("switch", "-c", name, "main", cwd=self.source)
+            self.git("commit", "--allow-empty", "--author=Contributor <contributor@example.com>",
+                     "-m", name, cwd=self.source)
+            self.git("switch", "topic", cwd=self.source)
+            self.git("merge", "--no-ff", name, "-m", f"Merge {name}", cwd=self.source)
+        self.git("switch", "topic")
+        return self.git("rev-parse", "HEAD", cwd=self.source).strip()
+
+    def assert_merge_tail(self, merge, count):
+        self.git("merge-base", "--is-ancestor", merge, "topic")
+        self.assertEqual(self.git("show", "-s", "--format=%G?", merge).strip(), "N")
+        tail = self.git("rev-list", "topic", f"^{merge}", "^refs/remotes/origin/main").splitlines()
+        self.assertEqual(len(tail), count)
+        for commit in tail:
+            self.git("verify-commit", commit)
+        self.assertEqual(self.git("rev-parse", "topic^{tree}"),
+                         self.git("rev-parse", "topic^{tree}", cwd=self.source))
+
+    def test_dependency_merges_preserved_and_only_tail_signed(self):
+        merge = self.dependency_merges()
+        for name in ("my first change", "my second change"):
+            self.git("commit", "--allow-empty", "-m", name, cwd=self.source)
+        result = self.run_script()
+        self.assertIn(f"Protected merged dependencies through {merge}", result.stdout)
+        self.assertIn("2 commit(s)", result.stdout)
+        self.assertEqual(self.git("rev-parse", "topic~2").strip(), merge)
+        self.assert_merge_tail(merge, 2)
+
+    def test_dependency_merge_at_tip_needs_no_signing_key(self):
+        merge = self.dependency_merges()
+        self.git("config", "gpg.program", "/usr/bin/false")
+        result = self.run_script()
+        self.assertIn("0 commit(s)", result.stdout)
+        self.assertEqual(self.git("rev-parse", "topic").strip(), merge)
+        self.assert_merge_tail(merge, 0)
+
+    def test_later_upstream_merge_does_not_hide_topic_tail(self):
+        merge = self.dependency_merges()
+        self.git("commit", "--allow-empty", "-m", "my change", cwd=self.source)
+        self.git("switch", "main", cwd=self.source)
+        self.git("commit", "--allow-empty", "-m", "upstream change", cwd=self.source)
+        upstream = self.git("rev-parse", "HEAD", cwd=self.source).strip()
+        self.git("switch", "topic", cwd=self.source)
+        self.git("merge", "--no-ff", "main", "-m", "Merge upstream", cwd=self.source)
+        result = self.run_script()
+        self.assertIn(f"Protected merged dependencies through {merge}", result.stdout)
+        self.assertIn("2 commit(s)", result.stdout)
+        self.assertEqual(self.git("rev-parse", "topic^2").strip(), upstream)
+        self.assert_merge_tail(merge, 2)
+
+    def test_dependency_merge_dry_run_reports_only_tail(self):
+        merge = self.dependency_merges()
+        self.git("commit", "--allow-empty", "-m", "my change", cwd=self.source)
+        source = self.git("rev-parse", "HEAD", cwd=self.source)
+        self.git("config", "gpg.program", "/usr/bin/false")
+        result = self.run_script("--dry-run")
+        self.assertIn(f"Protected merged dependencies through {merge}", result.stdout)
+        self.assertIn("1 commit(s)", result.stdout)
+        self.assertEqual(self.git("rev-parse", "topic").strip(), self.previous)
+        self.assertEqual(self.git("rev-parse", "topic", cwd=self.source), source)
+
+    def test_published_parent_above_merge_extends_protection(self):
+        merge = self.dependency_merges()
+        self.git("commit", "--allow-empty", "--author=Contributor <contributor@example.com>",
+                 "-m", "published parent change", cwd=self.source)
+        parent = self.git("rev-parse", "HEAD", cwd=self.source).strip()
+        publisher = self.root / "publisher"
+        self.git("clone", "--bare", str(self.source), str(publisher), cwd=self.root)
+        self.git("branch", "-m", "topic", "parent", cwd=publisher)
+        self.git("remote", "add", "contributor", str(publisher))
+        self.git("commit", "--allow-empty", "-m", "my change", cwd=self.source)
+        result = self.run_script()
+        self.assertIn(f"Protected merged dependencies through {merge}", result.stdout)
+        self.assertIn(f"Protected stacked base contributor/parent: {parent}", result.stdout)
+        self.assertIn("1 commit(s)", result.stdout)
+        self.assert_stack_preserved(parent)
 
     def sign_source_topic(self, contributor=False):
         # Sign only the two topic commits; retain the upstream base unchanged.
