@@ -305,3 +305,92 @@ brew install bats-core
 bats tests/
 python3 -m unittest discover -s tests -p 'test_*.py'
 ```
+
+## HWI simulator helpers
+
+These helpers run on the current Ubuntu machine as the current user. They do
+not connect to another account or require host root access. Install this
+repository at `~/dev-utils`, or call the scripts from another checkout.
+
+`hwi-check-prereqs.py` checks Ubuntu system packages before native builds.
+It reads dpkg/apt state, recognizes installed versioned libclang packages and
+QEMU packaging alternatives, and prints an install command for missing packages
+available in the local apt metadata. It does not run sudo, update apt metadata,
+or install anything. Ask the user to install missing packages as root before
+choosing a workaround; reuse existing local toolchains when they suffice.
+
+```sh
+~/dev-utils/hwi-check-prereqs.py                    # full installation sweep
+~/dev-utils/hwi-check-prereqs.py --device trezor-t  # repeat --device as needed
+```
+
+Exit status is 0 when recommended prerequisites are installed, 1 when packages
+or Ledger's `qemu-arm-static` are missing, and 2 if the check failed. This checks
+system package presence, not branch-specific compiler/CMake/protoc/Rust pins,
+SDK images, or Python dependencies. Distro Python headers/venv packages are a
+baseline recommendation; user-managed Python can provide those capabilities.
+For cached simulator tests, inspect actual runtime libraries instead of requiring
+the full build package set. Compare requirements with the chosen HWI branch.
+
+`hwi-coldcard-runtime.py` creates a small Coldcard or Coldcard Edge runtime from
+a built firmware tree. It copies the native binary, dereferences generated
+Python-file links, records source/binary provenance, and creates empty writable
+state directories. Existing destinations are refused. Build trees remain
+available for rebuilding, while runtime copies do not inherit registered policies.
+
+```sh
+~/dev-utils/hwi-coldcard-runtime.py /path/to/built/firmware /path/to/store/firmware
+~/dev-utils/hwi-coldcard-runtime.py /path/to/store/firmware /path/to/run/firmware
+```
+
+Pass `/path/to/run/firmware/unix/simulator.py` to HWI's `--coldcard-path` or
+`--coldcard-edge-path`. Use a new run directory for repeated policy tests.
+
+`hwi-build-env` supplies a fallback Ubuntu 24.04 environment when a native build
+needs unavailable development packages or an older compiler. It builds from
+source, mounts the HWI checkout read-only at `/hwi`, mounts `--work` at
+`/hwi/test/work`, and retains caches and Rust/Python toolchains outside the
+container. It uses rootless Podman by default; `HWI_CONTAINER_ENGINE=docker`
+selects an already-configured rootless Docker daemon.
+
+```sh
+~/dev-utils/hwi-build-env --build-image
+cd /path/to/HWI
+~/dev-utils/hwi-build-env --work /path/to/device-build -- ./setup_environment.sh --trezor-1
+```
+
+The image recipe is `share/hwi/Containerfile`. Source pins and HWI build patches
+come from the selected HWI checkout. Inspect its setup script before reuse:
+some setup targets reset source trees, reapply patches, or remove environments.
+For an existing build, run the necessary incremental build command instead of
+blindly repeating setup.
+
+Use `HWI_CACHE_ROOT`, `HWI_TOOLCHAIN_ROOT`, and optionally
+`HWI_CONTAINER_STORAGE` to select local storage locations; the helpers do not
+assign storage tiers. The latter selects a separate Podman image store without
+changing global configuration. Image-download temporary files default to the
+selected cache directory unless `TMPDIR` is already set. `HWI_CONTAINER_RUNROOT` can select its runtime
+state directory. Keep a store's existing runtime configuration consistent while
+containers are active. `--help` lists the defaults and other options.
+
+The image includes GCC 12/13, SDL development libraries, protobuf descriptors,
+and libclang. It does not replace device-specific build images pinned by HWI,
+such as the BitBox02 and Ledger application SDKs. Install runtime Python
+dependencies in the HWI test environment separately. Built simulators can be
+run natively when their shared-library requirements are available on the host.
+
+`hwi-run-targeted-device-tests.py` is a fallback for HWI branches without the
+runner's native `--test` option. Prefer the native option when available.
+Run the helper from the HWI `test` directory with that checkout's Python:
+
+```sh
+cd /path/to/HWI/test
+../.venv/bin/python ~/dev-utils/hwi-run-targeted-device-tests.py ledger \
+  test_segwit_miniscript test_taproot_miniscript \
+  --simulator=/path/to/speculos/speculos.py --bitcoind=/path/to/bitcoind
+```
+
+It filters the assembled suite, including device-specific test classes, retains
+normal setup and teardown, and rejects every unmatched method-name pattern.
+Quote globs to prevent shell expansion. Simulator families with fixed endpoints
+still need serial runs, regardless of the selected methods.

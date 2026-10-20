@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# Run a simulator build with user-owned, persistent toolchains.
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+Usage: hwi-build-env [--repo DIR] --work DIR [--build-image] -- COMMAND [ARG...]
+       hwi-build-env --build-image
+
+The default repository is the current Git checkout. --work is mounted as
+/hwi/test/work; the checkout is mounted read-only at /hwi.
+
+Optional environment:
+  HWI_CONTAINER_ENGINE   podman (default) or docker
+  HWI_CONTAINER_IMAGE    localhost/hwi-sim-builder:ubuntu24
+  HWI_CONTAINER_STORAGE  separate Podman storage directory (optional)
+  HWI_CONTAINER_RUNROOT  Podman runtime directory (optional)
+  HWI_CACHE_ROOT         defaults to ${XDG_CACHE_HOME:-$HOME/.cache}/hwi
+  HWI_TOOLCHAIN_ROOT     defaults to ${XDG_DATA_HOME:-$HOME/.local/share}/hwi/toolchains/container
+EOF
+}
+
+repo=
+work=
+build_image=false
+while (($#)); do
+    case "$1" in
+        --repo|--work)
+            (($# >= 2)) || { usage >&2; exit 2; }
+            if [[ $1 == --repo ]]; then repo=$2; else work=$2; fi
+            shift 2 ;;
+        --build-image) build_image=true; shift ;;
+        --help|-h) usage; exit 0 ;;
+        --) shift; break ;;
+        *) printf 'Unknown option: %s\n' "$1" >&2; usage >&2; exit 2 ;;
+    esac
+done
+
+engine=("${HWI_CONTAINER_ENGINE:-podman}")
+if [[ -n ${HWI_CONTAINER_STORAGE:-} ]]; then
+    [[ ${engine[0]##*/} == podman ]] || { echo 'HWI_CONTAINER_STORAGE requires Podman' >&2; exit 2; }
+    mkdir -p "$HWI_CONTAINER_STORAGE"
+    engine+=(--root "$(realpath "$HWI_CONTAINER_STORAGE")" --runroot "${HWI_CONTAINER_RUNROOT:-${XDG_RUNTIME_DIR:-/tmp}/hwi-podman-$(id -u)}")
+fi
+image=${HWI_CONTAINER_IMAGE:-localhost/hwi-sim-builder:ubuntu24}
+cache=${HWI_CACHE_ROOT:-${XDG_CACHE_HOME:-$HOME/.cache}/hwi}
+export TMPDIR=${TMPDIR:-$cache/tmp}
+mkdir -p "$cache" "$TMPDIR"
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+if $build_image; then
+    "${engine[@]}" build -t "$image" -f "$script_dir/share/hwi/Containerfile" "$script_dir/share/hwi"
+fi
+if (($# == 0)); then
+    $build_image && exit 0
+    usage >&2; exit 2
+fi
+[[ -n $work ]] || { echo '--work is required' >&2; exit 2; }
+repo=${repo:-$(git rev-parse --show-toplevel)}
+repo=$(realpath "$repo")
+[[ -f $repo/test/setup_environment.sh ]] || { echo 'Not an HWI checkout' >&2; exit 2; }
+toolchains=${HWI_TOOLCHAIN_ROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/hwi/toolchains/container}
+mkdir -p "$work" "$cache" "$toolchains"
+work=$(realpath "$work")
+cache=$(realpath "$cache")
+toolchains=$(realpath "$toolchains")
+timestamp=$(date -u +'%Y-%m-%dT%H:%M:%S+0000')
+exec "${engine[@]}" run --rm \
+    -v "$repo:/hwi:ro" -v "$work:/hwi/test/work" \
+    -v "$cache:/cache" -v "$toolchains:/toolchains" \
+    -e HTTP_PROXY -e HTTPS_PROXY -e NO_PROXY \
+    -e UV_CACHE_DIR=/cache/uv -e PIP_CACHE_DIR=/cache/pip \
+    -e UV_PYTHON_INSTALL_DIR=/toolchains/python \
+    -e RUSTUP_HOME=/toolchains/rustup -e CARGO_HOME=/toolchains/cargo \
+    -e GIT_AUTHOR_DATE="$timestamp" -e GIT_COMMITTER_DATE="$timestamp" \
+    -e POETRY_VIRTUALENVS_CREATE=false -w /hwi/test \
+    "$image" bash -c 'set -e; mkdir -p "$CARGO_HOME/bin"; if [ ! -x "$CARGO_HOME/bin/rustup" ]; then cp -a /root/.cargo/bin/. "$CARGO_HOME/bin/"; fi; export PATH="$CARGO_HOME/bin:$PATH"; python3 -m pip install /hwi; exec "$@"' hwi-build-env "$@"

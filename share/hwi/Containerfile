@@ -1,0 +1,25 @@
+FROM mirror.gcr.io/ubuntu:24.04
+ENV DEBIAN_FRONTEND=noninteractive TZ=UTC PIP_BREAK_SYSTEM_PACKAGES=1
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential gcc-12 g++-12 gcc-13 g++-13 cmake ninja-build git curl wget unzip ca-certificates \
+    python3 python3-pip python3-venv python-is-python3 pkg-config autoconf automake libtool \
+    libffi-dev libssl-dev libusb-1.0-0-dev libpcsclite-dev libsdl2-dev libsdl2-image-dev \
+    libslirp-dev libgcrypt20-dev libvncserver-dev libltdl-dev libncurses-dev \
+    gcc-arm-linux-gnueabihf libc6-dev-armhf-cross qemu-user-static swig protobuf-compiler \
+    scons rsync bzip2 xz-utils flex bison gperf ccache libudev-dev libjpeg-dev zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
+ENV VIRTUAL_ENV=/opt/hwi-venv
+ENV PATH=/opt/hwi-venv/bin:/root/.cargo/bin:$PATH
+RUN python3 -m venv /opt/hwi-venv \
+    && python3 -m pip install --no-cache-dir poetry uv pysdl2 pysdl2-dll \
+    && curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+ENV PATH=/root/.cargo/bin:$PATH
+RUN git config --global user.name 'HWI simulator builder' \
+    && git config --global user.email 'hwi-builder@localhost' \
+    && git config --global url.https://github.com/lwip-tcpip/lwip.git.insteadOf https://git.savannah.nongnu.org/git/lwip.git \
+    && git config --global --add url.https://github.com/lwip-tcpip/lwip.git.insteadOf https://git.savannah.gnu.org/r/lwip.git
+
+# Trezor legacy invokes protoc with -I/usr/include. The compiler package alone
+# does not install google/protobuf/descriptor.proto.
+RUN apt-get update && apt-get install -y --no-install-recommends libprotobuf-dev clang libclang-dev \
+    && rm -rf /var/lib/apt/lists/*
