@@ -359,15 +359,6 @@ def warn_skip(branch: str, reason: str, override: str) -> None:
           f"use {override} to override", file=sys.stderr, flush=True)
 
 
-def synced_ref(remote: str, branch: str) -> str:
-    # A remote rebase can remove the last pushed tip from its ancestry. Keep
-    # our own acknowledgement instead of mistaking that unchanged local tip
-    # for new work. Scope it to the source URL, remote name, and branch.
-    url = git("remote", "get-url", "--", remote).strip()
-    identity = b"\0".join((remote.encode(), url, branch.encode()))
-    return "refs/fetch-sign/synced/" + hashlib.sha256(identity).hexdigest()
-
-
 def commit_parts(raw: bytes) -> tuple[list[bytes], bytes]:
     header, message = raw.split(b"\n\n", 1)
     fields: list[bytes] = []
@@ -449,7 +440,6 @@ def main() -> None:
     parser.add_argument("--upstream", help="Upstream branch to fetch and protect (default: origin/master, or origin/main)")
     parser.add_argument("--base", help="Base ref to exclude (default: detect dependency merges and published parents)")
     parser.add_argument("--allow-dirty", action="store_true", help="Stash and restore local edits instead of skipping dirty worktrees")
-    parser.add_argument("--allow-unpushed", action="store_true", help="Allow replacement of local commits absent from the freshly fetched source branch")
     parser.add_argument("--no-push", action="store_true", help="Keep the signed branch local instead of pushing it back")
     parser.add_argument("--dry-run", action="store_true", help="Fetch and show commits without signing, syncing, or pushing")
     args = parser.parse_args()
@@ -498,13 +488,6 @@ def main() -> None:
     git("fetch", "--no-tags", "--no-recurse-submodules", "--", args.remote,
         f"refs/heads/{args.branch}:{backup}/source")
     source = oid(f"{backup}/source")
-    last_synced = synced_ref(args.remote, ref)
-    if (previous and not args.allow_unpushed and previous != oid(last_synced, required=False)
-            and git("rev-list", "-1", previous, f"^{source}").strip()):
-        warn_skip(args.branch, f"unpushed or divergent commits relative to {args.remote}/{args.branch}",
-                  "--allow-unpushed")
-        git("update-ref", "-d", f"{backup}/source", source)
-        return
     if not git("merge-base", "--all", upstream_tip, source, check=False).strip():
         raise Error("Fetched branch and upstream have no shared history; local branch left unchanged")
     if args.base is None:
@@ -593,8 +576,6 @@ def main() -> None:
                     f"Recovery refs retained at {backup}") from exc
     if stash:
         drop_saved_stash(checkout, stash, backup + "/stash")
-    if not args.no_push:
-        git("update-ref", last_synced, signed)
 
 
 

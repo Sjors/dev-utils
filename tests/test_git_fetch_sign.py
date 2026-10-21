@@ -86,9 +86,9 @@ class FetchSignTests(unittest.TestCase):
     def run_script(self, *args, ok=True, cwd=None, remote="workstation", defaults=False):
         self.source_before = self.git("rev-parse", "topic", cwd=self.source).strip()
         command = [sys.executable, str(SCRIPT), *args]
-        # Existing signing scenarios deliberately replace divergent history.
+        # Existing stash scenarios deliberately sync dirty worktrees.
         if not defaults:
-            command.extend(["--allow-dirty", "--allow-unpushed"])
+            command.append("--allow-dirty")
         if remote is not None:
             command.extend(["--remote", remote])
         result = subprocess.run(command, cwd=cwd or self.local,
@@ -1000,15 +1000,13 @@ class FetchSignTests(unittest.TestCase):
         self.assertEqual(self.git("for-each-ref", "refs/fetch-sign"), "")
         self.assertEqual(self.git("stash", "list"), "")
 
-    def test_default_skips_unpushed_commits_despite_stale_tracking_ref(self):
+    def test_default_replaces_divergent_history_despite_stale_tracking_ref(self):
         self.git("switch", "topic")
         self.git("update-ref", "refs/remotes/workstation/topic", self.previous)
         result = self.run_script(defaults=True)
-        self.assertIn("warning: skipping topic", result.stderr)
-        self.assertIn("--allow-unpushed", result.stderr)
-        self.assertEqual(self.git("rev-parse", "HEAD").strip(), self.previous)
-        self.assertEqual(self.git("rev-parse", "topic", cwd=self.source).strip(), self.source_before)
-        self.assertEqual(self.git("for-each-ref", "refs/fetch-sign"), "")
+        self.assertNotIn("warning: skipping", result.stderr)
+        self.assert_signed_history()
+        self.assertEqual(self.git("rev-parse", "HEAD"), self.git("rev-parse", "topic", cwd=self.source))
 
     def test_default_accepts_clean_local_tip_reachable_from_fresh_source(self):
         self.git("switch", "topic")
@@ -1017,94 +1015,77 @@ class FetchSignTests(unittest.TestCase):
         self.run_script(defaults=True)
         self.assert_signed_history()
 
-    def synced_tip(self):
-        return self.git("for-each-ref", "--format=%(objectname)",
-                        "refs/fetch-sign/synced").strip()
-
     def rewrite_remote_tip(self):
         self.git("commit", "--amend", "--allow-empty",
                  "-m", "updated remote commit", cwd=self.source)
 
-    def test_remote_rewrite_accepts_unchanged_last_synced_tip(self):
+    def test_remote_rewrite_accepts_unchanged_local_tip(self):
         self.git("switch", "topic")
         self.run_script()
         previous = self.git("rev-parse", "topic").strip()
-        self.assertEqual(self.synced_tip(), previous)
         self.rewrite_remote_tip()
         result = self.run_script(defaults=True)
         self.assertNotIn("warning: skipping", result.stderr)
         self.assertNotEqual(self.git("rev-parse", "topic").strip(), previous)
-        self.assertEqual(self.synced_tip(), self.git("rev-parse", "topic").strip())
         self.assertEqual(self.git("rev-parse", "topic").strip(),
                          self.git("rev-parse", "topic", cwd=self.source).strip())
         self.git("verify-commit", "topic")
 
-    def test_remote_rewrite_still_protects_local_commit_after_sync(self):
+    def test_remote_rewrite_replaces_and_backs_up_local_commit_after_sync(self):
         self.git("switch", "topic")
         self.run_script()
-        synced = self.synced_tip()
         self.git("commit", "--allow-empty", "-m", "new local work")
         local = self.git("rev-parse", "topic").strip()
         self.rewrite_remote_tip()
         result = self.run_script(defaults=True)
-        self.assertIn("--allow-unpushed", result.stderr)
-        self.assertEqual(self.git("rev-parse", "topic").strip(), local)
-        self.assertEqual(self.synced_tip(), synced)
+        self.assertNotIn("warning: skipping", result.stderr)
+        self.assertNotEqual(self.git("rev-parse", "topic").strip(), local)
+        self.assertEqual(self.git("rev-parse", "topic"), self.git("rev-parse", "topic", cwd=self.source))
+        backups = self.git("for-each-ref", "--format=%(objectname) %(refname)", "refs/fetch-sign")
+        self.assertTrue(any(line.startswith(local + " ") and line.endswith("/previous")
+                            for line in backups.splitlines()))
 
-    def test_no_push_does_not_acknowledge_generated_signed_tip(self):
+    def test_remote_rewrite_accepts_locally_signed_tip_after_no_push(self):
         self.git("switch", "topic")
         self.run_script("--no-push")
-        self.assertEqual(self.synced_tip(), "")
         local = self.git("rev-parse", "topic").strip()
         self.rewrite_remote_tip()
         result = self.run_script(defaults=True)
-        self.assertIn("--allow-unpushed", result.stderr)
-        self.assertEqual(self.git("rev-parse", "topic").strip(), local)
+        self.assertNotIn("warning: skipping", result.stderr)
+        self.assertNotEqual(self.git("rev-parse", "topic").strip(), local)
+        self.assertEqual(self.git("rev-parse", "topic"), self.git("rev-parse", "topic", cwd=self.source))
 
-    def test_failed_push_retains_previous_sync_acknowledgement(self):
+    def test_failed_push_restores_previous_tip_after_remote_rewrite(self):
         self.git("switch", "topic")
         self.run_script()
-        synced = self.synced_tip()
+        synced = self.git("rev-parse", "topic").strip()
         self.rewrite_remote_tip()
         (self.source / "tracked").write_text("remote edits\n")
         result = self.run_script(defaults=True, ok=False)
         self.assertIn("local sync reverted", result.stderr)
-        self.assertEqual(self.synced_tip(), synced)
         self.assertEqual(self.git("rev-parse", "topic").strip(), synced)
         self.git("restore", "tracked", cwd=self.source)
         self.run_script(defaults=True)
-        self.assertEqual(self.synced_tip(), self.git("rev-parse", "topic").strip())
+        self.assertEqual(self.git("rev-parse", "topic"), self.git("rev-parse", "topic", cwd=self.source))
 
-    def test_sync_acknowledgement_is_scoped_to_source_remote(self):
+    def test_dry_run_allows_divergent_history_without_replacing_it(self):
         self.git("switch", "topic")
-        self.run_script()
-        local = self.git("rev-parse", "topic").strip()
-        self.git("remote", "add", "other-source", str(self.source))
-        self.rewrite_remote_tip()
-        result = self.run_script(defaults=True, remote="other-source")
-        self.assertIn("--allow-unpushed", result.stderr)
-        self.assertEqual(self.git("rev-parse", "topic").strip(), local)
+        source = self.git("rev-parse", "topic", cwd=self.source)
+        result = self.run_script("--dry-run", defaults=True)
+        self.assertNotIn("warning: skipping", result.stderr)
+        self.assertIn("2 commit(s)", result.stdout)
+        self.assertEqual(self.git("rev-parse", "topic").strip(), self.previous)
+        self.assertEqual(self.git("rev-parse", "topic", cwd=self.source), source)
+        self.assertEqual(self.git("for-each-ref", "refs/fetch-sign"), "")
 
-    def test_dry_run_does_not_acknowledge_sync(self):
-        self.git("switch", "topic")
-        self.git("reset", "--hard", self.base)
-        self.run_script("--dry-run", defaults=True)
-        self.assertEqual(self.synced_tip(), "")
-
-    def test_dirty_override_does_not_allow_unpushed_commits(self):
+    def test_dirty_override_syncs_divergent_history_and_restores_edits(self):
         self.git("switch", "topic")
         (self.local / "notes").write_text("keep\n")
         result = self.run_script("--allow-dirty", defaults=True)
-        self.assertIn("--allow-unpushed", result.stderr)
+        self.assertNotIn("warning: skipping", result.stderr)
+        self.assert_signed_history()
         self.assertEqual((self.local / "notes").read_text(), "keep\n")
         self.assertEqual(self.git("stash", "list"), "")
-
-    def test_unpushed_override_does_not_allow_dirty_worktrees(self):
-        self.git("switch", "topic")
-        (self.local / "notes").write_text("keep\n")
-        result = self.run_script("--allow-unpushed", defaults=True)
-        self.assertIn("--allow-dirty", result.stderr)
-        self.assertEqual(self.git("rev-parse", "HEAD").strip(), self.previous)
 
     def test_failed_push_restores_dirty_index_and_original_stash(self):
         self.git("switch", "topic")

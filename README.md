@@ -96,19 +96,11 @@ the utility does not assume a source machine or remote name.
 Use `--no-push` to keep the signed result local.
 
 By default, skip a dirty target worktree with a warning, including staged,
-unstaged, untracked, and submodule changes. Also skip when any local commit is
-absent from the freshly fetched source branch, unless the local tip is exactly
-the last tip successfully pushed by this utility to that source and branch.
-This permits syncing a remote rebase when no local commits were added since
-the last sync. The acknowledgement is stored locally and scoped to the remote
-name, URL, and branch; dry runs, `--no-push`, and failed pushes do not update it.
-Older runs have no acknowledgement, so a remote rebase may require a one-time
-`--allow-unpushed` after checking that the local tip has no new work.
-Cached tracking refs alone never establish that local work was pushed.
-Skips exit successfully without replacing the branch.
-Use `--allow-dirty` to stash and restore local edits, and `--allow-unpushed`
-to deliberately replace unpushed or divergent local history. Each option
-overrides only its own check; recovery refs retain the old tip.
+unstaged, untracked, and submodule changes. Skips exit successfully without
+replacing the branch. Use `--allow-dirty` to stash and restore local edits.
+The fetched remote branch is authoritative: local commits absent from it,
+including divergent history, do not block syncing. Recovery refs retain the
+previous local tip, including any commits replaced by the sync.
 
 Already signed topic commits are kept with their original IDs
 and signatures when their parents are unchanged. Adding an unsigned commit

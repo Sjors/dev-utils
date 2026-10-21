@@ -1,4 +1,4 @@
-.TH GIT-FETCH-SIGN "1" "October 20, 2026" "git-fetch-sign" "User Commands"
+.TH GIT-FETCH-SIGN "1" "October 21, 2026" "git-fetch-sign" "User Commands"
 .SH NAME
 git-fetch-sign \- fetch a remote topic branch and sign its commits locally
 .SH SYNOPSIS
@@ -20,18 +20,11 @@ Use --no-push to keep the result local.
 Run from any worktree in the repository. If the branch is checked out in a
 linked worktree, that worktree is updated. By default, dirty worktrees are
 skipped with a warning, including staged, unstaged, untracked, and submodule
-changes. Local commits absent from the freshly fetched source branch also cause
-a warning and skip, including divergent history, unless the local tip exactly
-matches the last successful push by this utility to this source and branch.
-This allows a remote rebase when the local branch has no new commits since
-the last sync. Store this acknowledgement in a local ref scoped to the remote
-name, URL, and branch. Dry runs, --no-push, and failed pushes do not update it.
-Runs made by older versions have no acknowledgement; after a remote rebase,
-check for new local work before using --allow-unpushed once.
-Cached tracking refs alone do not establish that local work has been pushed.
-Skips exit successfully
-without replacing the branch. Use --allow-dirty and --allow-unpushed to override
-these checks independently.
+changes. Skips exit successfully without replacing the branch. Use --allow-dirty
+to stash and restore local edits.
+The fetched remote branch is authoritative: local commits absent from it,
+including divergent history, do not block syncing. Recovery refs retain the
+previous local tip, including any commits replaced by the sync.
 .PP
 With --allow-dirty, local staged, unstaged, and untracked changes are stashed
 immediately before replacing the branch,
@@ -160,13 +153,6 @@ The signed branch is pushed back to this remote after the local sync.
 .TP
 \fB\-\-allow-dirty\fR
 Stash and restore local edits instead of skipping a dirty target worktree.
-This does not permit replacing unpushed commits; use --allow-unpushed as well
-when both checks apply.
-.TP
-\fB\-\-allow-unpushed\fR
-Allow replacement of local commits absent from the freshly fetched source
-branch. The old tip remains in recovery refs. Dirty worktrees still require
---allow-dirty.
 .TP
 \fB\-\-no-push\fR
 Keep the signed branch local without pushing it back to the source remote.
