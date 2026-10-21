@@ -27,6 +27,10 @@ tool = Path(sys.argv[0]).name
 with open(os.environ["TOOL_LOG"], "a") as log:
     log.write(json.dumps([tool, *args]) + "\n")
 command = args[0]
+if os.environ.get("WATCH_OUTPUT"):
+    output = Path(os.environ["WATCH_OUTPUT"])
+    for relative in json.loads(os.environ["WATCH_FILES"]):
+        assert not (output / relative).exists(), "Published before all targets succeeded"
 if os.environ.get("FAIL_COMMAND") == command:
     sys.exit(1)
 if command in ("--help", "--find"):
@@ -107,7 +111,8 @@ class SignApplesTests(unittest.TestCase):
                      "SIGNAPPLE_CERTIFICATE", "SIGNAPPLE_API_KEY",
                      "SIGNAPPLE_KEY_ID", "SIGNAPPLE_ISSUER",
                      "FAIL_COMMAND", "NOTARY_INFO", "APPLY_SILENT_FAIL",
-                     "NO_SUBMISSION", "SUBMISSION", "SIGN_ARCHES", "FAIL_TARGET"):
+                     "NO_SUBMISSION", "SUBMISSION", "SIGN_ARCHES", "FAIL_TARGET",
+                     "WATCH_OUTPUT", "WATCH_FILES"):
             self.env.pop(name, None)
         self.env.update(PATH=str(mock_bin) + os.pathsep + self.env["PATH"],
                         TOOL_LOG=str(self.log), SIGNAPPLE_PASSPHRASE="fake signing secret")
@@ -126,6 +131,7 @@ class SignApplesTests(unittest.TestCase):
                 "--", *(self.targets if targets is None else targets)]
 
     def run_script(self, args=None, ok=True, trace=False):
+        original_output = self.output_state()
         command = ["/bin/bash", "-x", str(SCRIPT)] if trace else [str(SCRIPT)]
         result = subprocess.run(
             [*command, *(self.arguments() if args is None else args)],
@@ -134,8 +140,24 @@ class SignApplesTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         else:
             self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertFalse(self.output.exists())
+            self.assertEqual(self.output_state(), original_output)
         self.assertEqual(list(self.root.rglob(".sign-apples.*")), [])
+        return result
+
+    def output_state(self):
+        if self.output.is_symlink():
+            return {".": ("symlink", os.readlink(self.output))}
+        if not self.output.exists():
+            return {}
+        result = {}
+        for path in [self.output, *self.output.rglob("*")]:
+            name = str(path.relative_to(self.output))
+            if path.is_symlink():
+                result[name] = ("symlink", os.readlink(path))
+            elif path.is_dir():
+                result[name] = ("directory", path.stat().st_mode)
+            else:
+                result[name] = ("file", path.read_bytes(), path.stat().st_mode)
         return result
 
     def calls(self, command=None):
@@ -360,6 +382,16 @@ class SignApplesTests(unittest.TestCase):
         self.assertEqual(len(self.calls("notarize")), 2)
         self.assertEqual(len(self.calls("notarytool")), 1)
 
+    def test_later_target_failure_preserves_existing_output(self):
+        self.output.mkdir()
+        (self.output / "previous-release.arm64sign").write_text("existing signature")
+        other = self.inputs / "other program"
+        other.write_text("unsigned")
+        self.env["FAIL_TARGET"] = other.name
+        self.run_script(self.arguments([self.targets[0], other.name]), ok=False)
+        self.assertEqual(len(self.calls("notarize")), 2)
+        self.assertEqual(len(self.calls("notarytool")), 1)
+
     def test_only_top_level_accepted_json_status_succeeds(self):
         for info in ('{"status":"Invalid"}', '{"status":"In Progress"}',
                      '{"status":"accepted"}', '{"message":"Accepted"}',
@@ -404,15 +436,79 @@ class SignApplesTests(unittest.TestCase):
                 self.run_script(self.arguments([target]), ok=False)
                 self.assertEqual(self.calls(), [])
 
-    def test_existing_output_is_preserved(self):
+    def test_existing_output_preserves_old_releases_and_publishes_after_success(self):
         self.output.mkdir()
         marker = self.output / "keep"
         marker.write_text("existing signatures")
-        result = subprocess.run([str(SCRIPT), *self.arguments()], cwd=self.root,
-                                env=self.env, capture_output=True, text=True)
-        self.assertNotEqual(result.returncode, 0)
+        old_release = self.output / "arm64/pkg-old/bin/program.arm64sign"
+        old_release.parent.mkdir(parents=True)
+        old_release.write_text("previous release")
+        self.env.update(WATCH_OUTPUT=str(self.output), WATCH_FILES=json.dumps([
+            self.targets[0] + ".arm64sign", self.targets[1] + ".x86_64sign"]))
+        self.run_script()
         self.assertEqual(marker.read_text(), "existing signatures")
+        self.assertEqual(old_release.read_text(), "previous release")
+        for target, arch in zip(self.targets, ("arm64", "x86_64")):
+            self.assertEqual((self.output / (target + f".{arch}sign")).read_text(), "signature")
+        self.assertEqual(len(self.calls("notarytool")), 2)
+
+    def test_conflicting_signature_refuses_entire_publication(self):
+        conflict = self.output / (self.targets[1] + ".x86_64sign")
+        conflict.parent.mkdir(parents=True)
+        conflict.write_text("existing signature for this release")
+        result = self.run_script(ok=False)
+        self.assertIn("Refusing to overwrite existing output", result.stderr)
+        self.assertEqual(len(self.calls("notarytool")), 2)
+        self.assertFalse((self.output / (self.targets[0] + ".arm64sign")).exists())
+
+    def test_conflicting_directory_refuses_entire_publication(self):
+        self.output.mkdir()
+        (self.output / "x86_64").write_text("a file where a directory is needed")
+        self.run_script(ok=False)
+        self.assertFalse((self.output / "arm64").exists())
+
+    def test_output_parent_symlink_does_not_redirect_signatures(self):
+        outside = self.root / "outside"
+        outside.mkdir()
+        self.output.mkdir()
+        (self.output / "x86_64").symlink_to(outside, target_is_directory=True)
+        self.run_script(ok=False)
+        self.assertEqual(list(outside.iterdir()), [])
+        self.assertFalse((self.output / "arm64").exists())
+
+    def test_existing_signature_symlink_is_preserved(self):
+        outside = self.root / "existing signature"
+        outside.write_text("keep this signature")
+        conflict = self.output / (self.targets[1] + ".x86_64sign")
+        conflict.parent.mkdir(parents=True)
+        conflict.symlink_to(outside)
+        self.run_script(ok=False)
+        self.assertEqual(outside.read_text(), "keep this signature")
+
+    @unittest.skipIf(os.geteuid() == 0, "Root bypasses directory write permissions")
+    def test_publication_copy_failure_rolls_back_only_new_paths(self):
+        blocked = self.output / Path(self.targets[1]).parent
+        blocked.mkdir(parents=True)
+        (self.output / "keep").write_text("existing output")
+        blocked.chmod(0o500)
+        self.addCleanup(blocked.chmod, 0o755)
+        result = self.run_script(ok=False)
+        self.assertIn("Could not publish signatures", result.stderr)
+        self.assertFalse((self.output / "arm64").exists())
+        self.assertEqual(len(self.calls("notarytool")), 2)
+
+    def test_output_file_is_preserved(self):
+        self.output.write_text("existing file")
+        self.run_script(ok=False)
         self.assertEqual(self.calls(), [])
+
+    def test_output_directory_symlink_is_preserved(self):
+        outside = self.root / "existing directory"
+        outside.mkdir()
+        self.output.symlink_to(outside, target_is_directory=True)
+        self.run_script(ok=False)
+        self.assertEqual(self.calls(), [])
+        self.assertEqual(list(outside.iterdir()), [])
 
     def test_dangling_output_symlink_is_preserved(self):
         self.output.symlink_to(self.root / "absent")
@@ -424,6 +520,13 @@ class SignApplesTests(unittest.TestCase):
         bundle = self.inputs / "Example.app"
         bundle.mkdir()
         self.output = bundle / "signatures"
+        self.run_script(self.arguments([bundle.name]), ok=False)
+        self.assertEqual(self.calls("sign"), [])
+
+    def test_output_equal_to_bundle_is_rejected(self):
+        bundle = self.inputs / "Example.app"
+        bundle.mkdir()
+        self.output = bundle
         self.run_script(self.arguments([bundle.name]), ok=False)
         self.assertEqual(self.calls("sign"), [])
 

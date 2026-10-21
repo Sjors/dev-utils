@@ -10,7 +10,7 @@ Usage: sign-apples.sh [OPTIONS] --input-dir DIR --output-dir DIR [--] TARGET...
 
 Create detached macOS signatures, apply them, and notarize each target.
 TARGETs are paths relative to --input-dir: Mach-O binaries or .app bundles.
-The new --output-dir mirrors those paths and contains detached signatures
+The --output-dir mirrors those paths and contains detached signatures
 and, for app bundles, detached notarization tickets. Inputs are modified.
 Project mode selects both Apple host triples and all supported binary names.
 sv2-tp signs sv2-tp and test_sv2 for arm64-apple-darwin and x86_64-apple-darwin.
@@ -23,7 +23,7 @@ Options:
   --key-id ID         App Store Connect API key ID
   --issuer UUID       App Store Connect issuer ID
   --input-dir DIR     Root containing already extracted, unsigned targets
-  --output-dir DIR    New directory for signatures; must not already exist
+  --output-dir DIR    Signatures directory; may already contain other releases
   --project NAME      Select supported project targets (currently: sv2-tp)
   --release VERSION   Release directory version; required with --project
   -h, --help          Show this help
@@ -45,7 +45,8 @@ start with ~/; relative paths in the file resolve against its directory.
 
 Requires Bash 3.2+, signapple, Python 3, and xcrun notarytool (macOS).
 Every notarization must have a top-level JSON status of Accepted.
-On failure, no output directory is published; inputs may already be modified.
+Output is added only after all targets succeed. Existing files are never
+overwritten; a conflicting path fails publication. Inputs may already be modified.
 Use fresh extracted inputs when retrying. No downloads or Git operations run.
 HELP
 }
@@ -174,7 +175,7 @@ done
 input_dir=$(cd "$input_dir" && pwd -P)
 # Strip trailing slashes so even a dangling output symlink is refused.
 while [[ "$output_dir" == */ ]]; do output_dir="${output_dir%/}"; done
-[[ -n "$output_dir" && ! -e "$output_dir" && ! -L "$output_dir" ]] || die "Output already exists: $output_dir"
+[[ -n "$output_dir" && ! -L "$output_dir" && ( ! -e "$output_dir" || -d "$output_dir" ) ]] || die "Output must be a directory, not a file or symlink: $output_dir"
 
 targets=("$@")
 checked=()
@@ -222,7 +223,7 @@ mkdir -p "$output_parent"
 output_parent=$(cd "$output_parent" && pwd -P)
 output_dir="$output_parent/$(basename "$output_dir")"
 for target in "${targets[@]}"; do
-    [[ "$output_dir" != "$input_dir/$target/"* ]] || die "Output must be outside the target: $target"
+    [[ "$output_dir" != "$input_dir/$target" && "$output_dir" != "$input_dir/$target/"* ]] || die "Output must be outside the target: $target"
 done
 work_dir=$(mktemp -d "$output_parent/.sign-apples.XXXXXXXX")
 mkdir "$work_dir/signatures"
@@ -272,6 +273,57 @@ for target in "${targets[@]}"; do
     rm -rf -- "$stage"
 done
 
-[[ ! -e "$output_dir" && ! -L "$output_dir" ]] || die "Output appeared during signing: $output_dir"
-mv "$work_dir/signatures" "$output_dir"
+# Merge only after every target has succeeded. Check the entire destination
+# before writing, then create files exclusively so existing releases survive.
+# Roll back this run's additions if publication fails partway through.
+python3 - "$work_dir/signatures" "$output_dir" <<'PY'
+import pathlib, shutil, sys
+
+source, output = map(pathlib.Path, sys.argv[1:])
+directories = [output]
+files = []
+created_files = []
+created_directories = []
+
+def check_directory(path):
+    if path.is_symlink() or (path.exists() and not path.is_dir()):
+        raise ValueError(f"Output path is not a directory or is a symlink: {path}")
+
+try:
+    for path in sorted(source.rglob("*")):
+        destination = output / path.relative_to(source)
+        if path.is_symlink():
+            raise ValueError(f"Unexpected staged symlink: {path}")
+        if path.is_dir():
+            directories.append(destination)
+        elif path.is_file():
+            files.append((path, destination))
+        else:
+            raise ValueError(f"Unexpected staged file type: {path}")
+    for directory in directories:
+        check_directory(directory)
+    for _, destination in files:
+        if destination.exists() or destination.is_symlink():
+            raise ValueError(f"Refusing to overwrite existing output: {destination}")
+    for directory in directories:
+        try:
+            directory.mkdir()
+            created_directories.append(directory)
+        except FileExistsError:
+            check_directory(directory)
+    for path, destination in files:
+        with path.open("rb") as incoming, destination.open("xb") as outgoing:
+            created_files.append(destination)
+            shutil.copyfileobj(incoming, outgoing)
+except (OSError, ValueError, KeyboardInterrupt) as error:
+    # Remove files before their parent directories; retain pre-existing paths.
+    for paths, remove in ((created_files, pathlib.Path.unlink),
+                          (created_directories, pathlib.Path.rmdir)):
+        for path in reversed(paths):
+            try:
+                remove(path)
+            except OSError as cleanup_error:
+                print(f"Error: Could not roll back {path}: {cleanup_error}", file=sys.stderr)
+    sys.exit(f"Error: Could not publish signatures: {error}")
+PY
 echo "Signatures written to $output_dir"

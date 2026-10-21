@@ -330,7 +330,8 @@ done
 
 ~/utils/sign-apples.sh \
   --project sv2-tp --release 1.0.3 \
-  --input-dir ./release-output --output-dir ./release-signatures/osx
+  --input-dir ./release-output \
+  --output-dir "$HOME/dev/sv2-tp-detached-sigs/osx"
 ```
 
 The supported project is currently `sv2-tp`. Its preset signs `sv2-tp` and
@@ -348,7 +349,8 @@ For other layouts, keep specifying targets directly, without `--project` or
   --certificate /path/to/developer-id.p12 \
   --api-key /path/to/AuthKey_YOURKEYID.p8 \
   --key-id YOURKEYID --issuer YOUR_ISSUER_UUID \
-  --input-dir ./release-output --output-dir ./release-signatures/osx \
+  --input-dir ./release-output \
+  --output-dir "$HOME/dev/sv2-tp-detached-sigs/osx" \
   arm64-apple-darwin/sv2-tp-1.0.3/bin/sv2-tp
 ```
 
@@ -356,7 +358,10 @@ Targets are paths relative to `--input-dir`, with no leading/trailing slash,
 empty, `.` or `..` components, or newlines. Spaces are supported. Symlinks in
 target paths and duplicate or overlapping targets are refused. For a bundle,
 pass its relative path, such as `dist/Example.app`, instead of its executable.
-The output directory must be new and outside every target bundle.
+The output directory can already contain signatures for other releases, and
+it is created if absent. It must be outside every target bundle. An existing
+output path must be a directory; symlinks at the output root or within paths
+used for the new signatures are refused.
 
 The script prompts once for the signing passphrase. For unattended use, set
 `SIGNAPPLE_PASSPHRASE`; an explicitly empty value is supported. The API key
@@ -371,14 +376,19 @@ App bundles also include detached resource files and the notarization ticket.
 Standalone binaries are notarized without a stapled ticket. Each submission's
 top-level JSON status must be exactly `Accepted`; a rejected, pending, malformed,
 or unavailable verdict fails the run. Signatures are staged privately and
-published only after all targets succeed. Run one writer per output directory.
+added to the output directory only after all targets succeed. Existing files
+are never overwritten, including signatures for the same release. Publication
+checks all destination paths before copying; any conflict fails the run without
+changing the output. A copy error rolls back this run's new files and directories,
+preserving existing releases. Run one writer per output directory.
 
 Signing modifies the extracted inputs in place. Signapple can also create ZIP
 archives beside them during notarization. After a failure, inputs may already
 be signed; retry with freshly extracted artifacts. Temporary detached signatures
-are removed on exit, and no partial output is published. Review the successful
-output, then copy it to your detached signatures repository and commit/push it
-separately. The script does not download files or run Git commands.
+are removed on exit. Signing or notarization failures leave existing output
+unchanged. Point `--output-dir` directly at the detached signatures repository's
+`osx` directory, as above, then review and commit/push the additions separately.
+The script does not download files or run Git commands.
 
 ```sh
 ~/utils/sign-apples.sh --help

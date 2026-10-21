@@ -11,7 +11,7 @@ sign-apples.sh \- create detached macOS signatures and verify notarization
 .SH DESCRIPTION
 Create detached macOS signatures, apply them, and notarize each target.
 TARGETs are paths relative to \fB\-\-input\-dir\fR: Mach\-O binaries or .app bundles.
-The new \fB\-\-output\-dir\fR mirrors those paths and contains detached signatures
+The \fB\-\-output\-dir\fR mirrors those paths and contains detached signatures
 and, for app bundles, detached notarization tickets. Inputs are modified.
 Project mode selects both Apple host triples and all supported binary names.
 sv2\-tp signs sv2\-tp and test_sv2 for arm64\-apple\-darwin and x86_64\-apple\-darwin.
@@ -37,7 +37,7 @@ App Store Connect issuer ID
 Root containing already extracted, unsigned targets
 .TP
 \fB\-\-output\-dir\fR DIR
-New directory for signatures; must not already exist
+Signatures directory; may already contain other releases
 .TP
 \fB\-\-project\fR NAME
 Select supported project targets (currently: sv2\-tp)
@@ -79,5 +79,6 @@ start with ~/; relative paths in the file resolve against its directory.
 .PP
 Requires Bash 3.2+, signapple, Python 3, and xcrun notarytool (macOS).
 Every notarization must have a top\-level JSON status of Accepted.
-On failure, no output directory is published; inputs may already be modified.
+Output is added only after all targets succeed. Existing files are never
+overwritten; a conflicting path fails publication. Inputs may already be modified.
 Use fresh extracted inputs when retrying. No downloads or Git operations run.
