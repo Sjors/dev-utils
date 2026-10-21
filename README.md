@@ -268,6 +268,128 @@ before retrying; the script does not roll back Git operations.
 Published attestations use the chosen signer name and GPG key. Commits also
 use your configured Git name/email and any configured commit-signing key.
 
+## `sign-apples.sh`
+
+Create detached macOS signatures with
+[signapple](https://github.com/achow101/signapple), apply and verify them, submit
+each target for notarization, and check Apple's verdict with `notarytool`.
+Accepts Mach-O binaries (including universal binaries) and `.app` bundles for
+any project. Credentials can come from `.env`, environment variables, or
+command-line options. Input/output locations remain explicit arguments.
+Requires macOS, Bash 3.2 or newer, Python 3, a working `signapple` on `PATH`,
+and Xcode Command Line Tools providing `xcrun notarytool`.
+
+Obtain a Developer ID signing certificate/private key exported as PKCS#12, an
+App Store Connect API private key, its key ID, and its issuer UUID. See
+[signapple's certificate documentation](https://github.com/achow101/signapple/blob/master/docs/certificates.md)
+and [notarization documentation](https://github.com/achow101/signapple/blob/master/docs/notarization.md).
+Keep the API key filename ending in `AuthKey_<KEY_ID>.p8`: signapple derives
+the key ID from that filename, and the script checks it against `--key-id`.
+
+For repeated use, copy the example to `.env` and edit the credential paths,
+key ID, and issuer UUID. `.env` and `.env.*` are ignored by Git, with
+`.env.example` tracked as the template:
+
+```sh
+cd ~/utils
+cp .env.example .env
+```
+
+The script loads `.env` from the current working directory when present.
+Use `--env-file /path/to/.env` to select a different file; an explicitly
+selected file must exist. Only the six `SIGNAPPLE_*` variables below are
+accepted. Values can be single- or double-quoted, blank lines and comments
+are allowed, and an optional `export` prefix is accepted. Values are literal:
+the loader does not run shell commands or expand `$VARIABLE` references.
+Credential paths in the file support `~/` and otherwise resolve relative to
+the file's directory. Relative paths in arguments or environment variables
+resolve relative to the working directory. Quote paths or values with spaces.
+Duplicate settings and malformed or unknown assignments fail before signing.
+
+| Variable | Equivalent option or behavior |
+| --- | --- |
+| `SIGNAPPLE_CERTIFICATE` | `--certificate` |
+| `SIGNAPPLE_API_KEY` | `--api-key` |
+| `SIGNAPPLE_KEY_ID` | `--key-id` |
+| `SIGNAPPLE_ISSUER` | `--issuer` |
+| `SIGNAPPLE_PASSPHRASE` | Signing passphrase; prompt once if unset |
+| `SIGNAPPLE_NOTARY_PASSPHRASE` | API key passphrase; defaults to signing passphrase |
+
+Command-line credential options override environment variables, which override
+the file. An explicitly empty environment value also overrides the file.
+
+Download and extract the codesigning artifacts separately. For example, after
+copying a Guix output directory to `./release-output`, extract the sv2-tp
+codesigning archives (replace the version and paths with your release):
+
+```sh
+for arch in arm64-apple-darwin x86_64-apple-darwin; do
+  tar -xzf "release-output/$arch/sv2-tp-1.0.3-$arch-codesigning.tar.gz" \
+    -C "release-output/$arch"
+done
+
+~/utils/sign-apples.sh \
+  --project sv2-tp --release 1.0.3 \
+  --input-dir ./release-output --output-dir ./release-signatures/osx
+```
+
+The supported project is currently `sv2-tp`. Its preset signs `sv2-tp` and
+`test_sv2` beneath `<host>/sv2-tp-<version>/bin/` for both
+`arm64-apple-darwin` and `x86_64-apple-darwin`. All four files must exist.
+Here "host" means the build target triple; the script does not select an SSH
+host or download artifacts. `--release` is required with `--project` and uses
+letters, digits, dots, underscores or hyphens, starting with a letter or digit.
+
+For other layouts, keep specifying targets directly, without `--project` or
+`--release`. Credential arguments also remain available, for example:
+
+```sh
+~/utils/sign-apples.sh \
+  --certificate /path/to/developer-id.p12 \
+  --api-key /path/to/AuthKey_YOURKEYID.p8 \
+  --key-id YOURKEYID --issuer YOUR_ISSUER_UUID \
+  --input-dir ./release-output --output-dir ./release-signatures/osx \
+  arm64-apple-darwin/sv2-tp-1.0.3/bin/sv2-tp
+```
+
+Targets are paths relative to `--input-dir`, with no leading/trailing slash,
+empty, `.` or `..` components, or newlines. Spaces are supported. Symlinks in
+target paths and duplicate or overlapping targets are refused. For a bundle,
+pass its relative path, such as `dist/Example.app`, instead of its executable.
+The output directory must be new and outside every target bundle.
+
+The script prompts once for the signing passphrase. For unattended use, set
+`SIGNAPPLE_PASSPHRASE`; an explicitly empty value is supported. The API key
+uses the same passphrase unless `SIGNAPPLE_NOTARY_PASSPHRASE` is set; set it
+to an empty value for an unencrypted API key. Passphrases are passed to
+signapple's `--passphrase` option and can be visible in process arguments.
+Shell tracing is disabled before reading them.
+
+Detached signatures mirror each target's parent path beneath `--output-dir`,
+for example `arm64-apple-darwin/sv2-tp-1.0.3/bin/sv2-tp.arm64sign`.
+App bundles also include detached resource files and the notarization ticket.
+Standalone binaries are notarized without a stapled ticket. Each submission's
+top-level JSON status must be exactly `Accepted`; a rejected, pending, malformed,
+or unavailable verdict fails the run. Signatures are staged privately and
+published only after all targets succeed. Run one writer per output directory.
+
+Signing modifies the extracted inputs in place. Signapple can also create ZIP
+archives beside them during notarization. After a failure, inputs may already
+be signed; retry with freshly extracted artifacts. Temporary detached signatures
+are removed on exit, and no partial output is published. Review the successful
+output, then copy it to your detached signatures repository and commit/push it
+separately. The script does not download files or run Git commands.
+
+```sh
+~/utils/sign-apples.sh --help
+man ./share/man/man1/sign-apples.sh.1
+python3 -m unittest discover -s tests -p 'test_sign_apples.py'
+```
+
+Tests use fake signing and notary tools and require no Apple keys or network.
+They verify the wrapper's behavior; a real signing/notarization run with the
+credential holder is still needed to validate Apple service integration.
+
 ## `guix-try`
 
 Fetch a macOS guix build from a remote SSH host, extract it, ad hoc codesign it
@@ -338,6 +460,16 @@ SOURCE_DATE_EPOCH=1780272000 TZ=UTC help2man ./git-range-diff-remote --no-info \
   --name "range-diff local commits against a PR's remote state" \
   -o share/man/man1/git-range-diff-remote.1
 git diff --exit-code -- share/man/man1/git-range-diff-remote.1
+```
+
+Regenerate the `sign-apples.sh` manual with the same help2man version and fixed
+date environment:
+
+```sh
+SOURCE_DATE_EPOCH=1780272000 TZ=UTC help2man ./sign-apples.sh --no-info \
+  --name "create detached macOS signatures and verify notarization" \
+  -o share/man/man1/sign-apples.sh.1
+git diff --exit-code -- share/man/man1/sign-apples.sh.1
 ```
 
 ```sh

@@ -1,3 +1,6 @@
 AGENTS.md
 tmp
 __pycache__/
+.env
+.env.*
+!.env.example

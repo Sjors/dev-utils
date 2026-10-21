@@ -21,6 +21,17 @@ jobs:
             --name "range-diff local commits against a PR's remote state" \
             -o share/man/man1/git-range-diff-remote.1
           git diff --exit-code -- share/man/man1/git-range-diff-remote.1
+          help2man ./sign-apples.sh --no-info \
+            --name "create detached macOS signatures and verify notarization" \
+            -o share/man/man1/sign-apples.sh.1
+          git diff --exit-code -- share/man/man1/sign-apples.sh.1
+
+  signing:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Test signing workflow without Apple credentials
+        run: python3 -m unittest discover -s tests -p 'test_sign_apples.py'
 
   bats:
     runs-on: ubuntu-latest
