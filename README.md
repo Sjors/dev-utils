@@ -275,8 +275,10 @@ Create detached macOS signatures with
 each target for notarization, and check Apple's verdict with `notarytool`.
 Accepts Mach-O binaries (including universal binaries) and `.app` bundles for
 any project. Credentials can come from `.env`, environment variables, or
-command-line options. Input/output locations remain explicit arguments.
-Requires macOS, Bash 3.2 or newer, Python 3, a working `signapple` on `PATH`,
+command-line options. Select local inputs with `--input-dir` or fetch Guix
+artifacts with `--remote` in project mode. Set `--output-dir` explicitly or, for
+`--project sv2-tp`, default it to `SV2_TP_DETACHED_SIGS_DIR/osx`.
+Requires macOS, Bash 3.2 or newer, Git, Python 3, a working `signapple` on `PATH`,
 and Xcode Command Line Tools providing `xcrun notarytool`.
 
 Obtain a Developer ID signing certificate/private key exported as PKCS#12, an
@@ -297,11 +299,11 @@ cp .env.example .env
 
 The script loads `.env` from the current working directory when present.
 Use `--env-file /path/to/.env` to select a different file; an explicitly
-selected file must exist. Only the six `SIGNAPPLE_*` variables below are
+selected file must exist. Only the variables below are
 accepted. Values can be single- or double-quoted, blank lines and comments
 are allowed, and an optional `export` prefix is accepted. Values are literal:
 the loader does not run shell commands or expand `$VARIABLE` references.
-Credential paths in the file support `~/` and otherwise resolve relative to
+Paths in the file support `~/` and otherwise resolve relative to
 the file's directory. Relative paths in arguments or environment variables
 resolve relative to the working directory. Quote paths or values with spaces.
 Duplicate settings and malformed or unknown assignments fail before signing.
@@ -314,32 +316,59 @@ Duplicate settings and malformed or unknown assignments fail before signing.
 | `SIGNAPPLE_ISSUER` | `--issuer` |
 | `SIGNAPPLE_PASSPHRASE` | Signing passphrase; prompt once if unset |
 | `SIGNAPPLE_NOTARY_PASSPHRASE` | API key passphrase; defaults to signing passphrase |
+| `SV2_TP_DETACHED_SIGS_DIR` | Repository root; defaults `--project sv2-tp` output to its `osx` subdirectory |
 
-Command-line credential options override environment variables, which override
+Command-line options override environment variables, which override
 the file. An explicitly empty environment value also overrides the file.
 
-Download and extract the codesigning artifacts separately. For example, after
-copying a Guix output directory to `./release-output`, extract the sv2-tp
-codesigning archives (replace the version and paths with your release):
+For example, set `SV2_TP_DETACHED_SIGS_DIR=~/dev/sv2-tp-detached-sigs` in `.env`
+to omit `--output-dir` with `--project sv2-tp`. This setting names the repository
+root; the macOS workflow appends `osx`. An explicit `--output-dir` is used as-is.
+
+Fetch and extract the codesigning artifacts directly from your Guix machine:
+
+```sh
+~/utils/sign-apples.sh \
+  --project sv2-tp --release 1.0.3 \
+  --remote guix \
+  --output-dir "$HOME/dev/sv2-tp-detached-sigs/osx"
+```
+
+`--remote` accepts an SSH alias or `[user@]hostname`; configure custom ports
+or IPv6 addresses using an alias in `~/.ssh/config`. It fetches both Apple archives
+with one SCP invocation and one remote wildcard source, sharing a single SSH
+connection so a security key only needs one authorization. The default paths are:
+
+```text
+sv2-tp/guix-build-1.0.3/output/arm64-apple-darwin/sv2-tp-1.0.3-arm64-apple-darwin-codesigning.tar.gz
+sv2-tp/guix-build-1.0.3/output/x86_64-apple-darwin/sv2-tp-1.0.3-x86_64-apple-darwin-codesigning.tar.gz
+```
+
+Use `--remote-repo /path/to/sv2-tp` to select another checkout. Relative checkout
+paths resolve from the remote user's home; paths may contain letters, digits,
+underscores, dots, slashes and hyphens and must not start with a hyphen.
+Archives are extracted into private temporary directories, including helper
+files beside the release tree. Helper scripts are never executed. Absolute
+paths, paths containing `..`, links, and special files are refused. All selected
+targets must exist before signing starts. Downloads and extracted inputs are
+removed on success or failure, so retrying remote mode fetches fresh inputs.
+
+The supported project is currently `sv2-tp`. Its preset signs `sv2-tp` and
+`test_sv2` beneath `<host>/sv2-tp-<version>/bin/` for both
+`arm64-apple-darwin` and `x86_64-apple-darwin`. All four files must exist.
+`--release` is required with `--project` and uses letters, digits, dots,
+underscores or hyphens, starting with a letter or digit.
+
+To use already downloaded and extracted artifacts, replace `--remote guix`
+with `--input-dir ./release-output`. These options cannot be combined.
+For example, prepare local inputs with:
 
 ```sh
 for arch in arm64-apple-darwin x86_64-apple-darwin; do
   tar -xzf "release-output/$arch/sv2-tp-1.0.3-$arch-codesigning.tar.gz" \
     -C "release-output/$arch"
 done
-
-~/utils/sign-apples.sh \
-  --project sv2-tp --release 1.0.3 \
-  --input-dir ./release-output \
-  --output-dir "$HOME/dev/sv2-tp-detached-sigs/osx"
 ```
-
-The supported project is currently `sv2-tp`. Its preset signs `sv2-tp` and
-`test_sv2` beneath `<host>/sv2-tp-<version>/bin/` for both
-`arm64-apple-darwin` and `x86_64-apple-darwin`. All four files must exist.
-Here "host" means the build target triple; the script does not select an SSH
-host or download artifacts. `--release` is required with `--project` and uses
-letters, digits, dots, underscores or hyphens, starting with a letter or digit.
 
 For other layouts, keep specifying targets directly, without `--project` or
 `--release`. Credential arguments also remain available, for example:
@@ -387,8 +416,17 @@ archives beside them during notarization. After a failure, inputs may already
 be signed; retry with freshly extracted artifacts. Temporary detached signatures
 are removed on exit. Signing or notarization failures leave existing output
 unchanged. Point `--output-dir` directly at the detached signatures repository's
-`osx` directory, as above, then review and commit/push the additions separately.
-The script does not download files or run Git commands.
+`osx` directory, as above. When the output is inside a Git worktree, the script
+commits only this run's generated files after successful signing, notarization,
+and publication. Project releases use a message such as
+`Add 1.1.3 detached macOS signatures`. Unrelated staged, unstaged, and untracked
+changes are preserved. Commits use your Git identity, hooks, and commit-signing
+configuration. No push runs; review and push the commit separately.
+
+Plain directories outside a Git worktree remain supported and receive files
+without a commit. If Git fails after publication, the script reports failure
+and retains the generated signatures so you can commit them manually without
+repeating signing and notarization.
 
 ```sh
 ~/utils/sign-apples.sh --help

@@ -7,7 +7,7 @@ sign-apples.sh \- create detached macOS signatures and verify notarization
 [\fI\,OPTIONS\/\fR] \fI\,--input-dir DIR --output-dir DIR \/\fR[\fI\,--\/\fR] \fI\,TARGET\/\fR...
 .br
 .B sign-apples.sh
-[\fI\,OPTIONS\/\fR] \fI\,--input-dir DIR --output-dir DIR --project sv2-tp --release VERSION\/\fR
+[\fI\,OPTIONS\/\fR] \fI\,(--input-dir DIR | --remote HOST) \/\fR[\fI\,--output-dir DIR\/\fR] \fI\,--project sv2-tp --release VERSION\/\fR
 .SH DESCRIPTION
 Create detached macOS signatures, apply them, and notarize each target.
 TARGETs are paths relative to \fB\-\-input\-dir\fR: Mach\-O binaries or .app bundles.
@@ -35,6 +35,12 @@ App Store Connect issuer ID
 .TP
 \fB\-\-input\-dir\fR DIR
 Root containing already extracted, unsigned targets
+.TP
+\fB\-\-remote\fR HOST
+Fetch Guix codesigning archives over SCP (project mode)
+.TP
+\fB\-\-remote\-repo\fR DIR
+Remote checkout (default: project name, relative to home)
 .TP
 \fB\-\-output\-dir\fR DIR
 Signatures directory; may already contain other releases
@@ -71,14 +77,28 @@ SIGNAPPLE_NOTARY_PASSPHRASE
 API key passphrase; defaults to signing passphrase
 .IP
 Set explicitly to empty for an unencrypted API key
+.TP
+SV2_TP_DETACHED_SIGS_DIR
+Repository root; defaults sv2\-tp output to its osx/
+.IP
+directory when \fB\-\-output\-dir\fR is omitted
 .PP
 These variables can also be set in .env (see .env.example). Precedence:
 command\-line options, then environment, then file. File values are literal,
-optionally quoted, without shell expansion. Credential paths in the file may
+optionally quoted, without shell expansion. Paths in the file may
 start with ~/; relative paths in the file resolve against its directory.
 .PP
-Requires Bash 3.2+, signapple, Python 3, and xcrun notarytool (macOS).
+Remote mode replaces \fB\-\-input\-dir\fR and requires \fB\-\-project\fR and \fB\-\-release\fR.
+It fetches <repo>/guix\-build\-<release>/output/<host>/
+<project>\-<release>\-<host>\-codesigning.tar.gz for both Apple hosts.
+Archives and extracted inputs are temporary and removed on exit.
+Use an SSH alias or [user@]hostname; configure ports in ~/.ssh/config.
+.PP
+Requires Bash 3.2+, Git, signapple, Python 3, and xcrun notarytool (macOS).
 Every notarization must have a top\-level JSON status of Accepted.
 Output is added only after all targets succeed. Existing files are never
 overwritten; a conflicting path fails publication. Inputs may already be modified.
-Use fresh extracted inputs when retrying. No downloads or Git operations run.
+Use fresh extracted inputs when retrying local mode. When output is in a Git
+worktree, only this run's signatures are committed; other changes are preserved.
+Plain output directories are supported. No push runs. If committing fails,
+signatures remain in the output directory for a manual commit.

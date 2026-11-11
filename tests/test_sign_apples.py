@@ -1,12 +1,15 @@
 """Exercise the signing workflow with fake tools; no Apple credentials/network."""
 
+import io
 import json
 import os
 from pathlib import Path
 import pty
 import select
+import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 
@@ -36,12 +39,24 @@ if os.environ.get("FAIL_COMMAND") == command:
 if command in ("--help", "--find"):
     sys.exit(0)
 
-if tool == "xcrun":
+if tool == "scp":
+    import shutil
+    assert len(args) == 2, "Use one remote source and one SSH connection"
+    assert Path(args[1]).is_dir()
+    sources = sorted(Path(os.environ["REMOTE_ARCHIVES"]).glob(Path(args[0]).name))
+    assert sources, "Remote glob matched no archives"
+    for source in sources:
+        if os.environ.get("FAIL_FETCH") in ("all", source.name):
+            sys.exit(1)
+        shutil.copyfile(source, Path(args[1]) / source.name)
+elif tool == "xcrun":
     assert args[:2] == ["notarytool", "info"]
     print(os.environ.get("NOTARY_INFO", '{"status": "Accepted"}'))
 elif command == "sign":
     assert args[1] == "--passphrase" and args[3] == "--hardened-runtime"
     target = Path(args[5])
+    if os.environ.get("REMOTE_ARCHIVES"):
+        assert target.stat().st_mode & 0o111, "Executable mode lost during extraction"
     stage = Path(args[args.index("--detach") + 1])
     if target.is_dir():
         dest = stage / target.name / "Contents/MacOS/main.arm64sign"
@@ -102,20 +117,20 @@ class SignApplesTests(unittest.TestCase):
         self.log = self.root / "tools.jsonl"
         mock_bin = self.root / "mock bin"
         mock_bin.mkdir()
-        for name in ("signapple", "xcrun"):
+        for name in ("signapple", "xcrun", "scp"):
             tool = mock_bin / name
             tool.write_text(f"#!{sys.executable}\n" + MOCK_TOOL)
             tool.chmod(0o755)
         self.env = dict(os.environ)
         for name in ("SIGNAPPLE_PASSPHRASE", "SIGNAPPLE_NOTARY_PASSPHRASE",
                      "SIGNAPPLE_CERTIFICATE", "SIGNAPPLE_API_KEY",
-                     "SIGNAPPLE_KEY_ID", "SIGNAPPLE_ISSUER",
+                     "SIGNAPPLE_KEY_ID", "SIGNAPPLE_ISSUER", "SV2_TP_DETACHED_SIGS_DIR",
                      "FAIL_COMMAND", "NOTARY_INFO", "APPLY_SILENT_FAIL",
                      "NO_SUBMISSION", "SUBMISSION", "SIGN_ARCHES", "FAIL_TARGET",
-                     "WATCH_OUTPUT", "WATCH_FILES"):
+                     "WATCH_OUTPUT", "WATCH_FILES", "REMOTE_ARCHIVES", "FAIL_FETCH"):
             self.env.pop(name, None)
         self.env.update(PATH=str(mock_bin) + os.pathsep + self.env["PATH"],
-                        TOOL_LOG=str(self.log), SIGNAPPLE_PASSPHRASE="fake signing secret")
+                        TOOL_LOG=str(self.log), TMPDIR=str(self.root), SIGNAPPLE_PASSPHRASE="fake signing secret")
         self.targets = ["arm64/pkg/bin/program", "x86_64/pkg/bin/program"]
         for target in self.targets:
             binary = self.inputs / target
@@ -130,7 +145,7 @@ class SignApplesTests(unittest.TestCase):
                 "--output-dir", str(self.output.relative_to(self.root)),
                 "--", *(self.targets if targets is None else targets)]
 
-    def run_script(self, args=None, ok=True, trace=False):
+    def run_script(self, args=None, ok=True, trace=False, output_unchanged=True):
         original_output = self.output_state()
         command = ["/bin/bash", "-x", str(SCRIPT)] if trace else [str(SCRIPT)]
         result = subprocess.run(
@@ -140,7 +155,8 @@ class SignApplesTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         else:
             self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertEqual(self.output_state(), original_output)
+            if output_unchanged:
+                self.assertEqual(self.output_state(), original_output)
         self.assertEqual(list(self.root.rglob(".sign-apples.*")), [])
         return result
 
@@ -268,6 +284,281 @@ class SignApplesTests(unittest.TestCase):
                          sorted(target + (".arm64sign" if target.startswith("arm64") else ".x86_64sign")
                                 for target in targets))
         self.assertEqual(len(self.calls("notarytool")), 4)
+
+    def remote_arguments(self, repo=None, include_output=True):
+        args = self.arguments([])[:-1]
+        index = args.index("--input-dir")
+        args[index:index + 2] = ["--remote", "builder@guix"]
+        args += ["--project", "sv2-tp", "--release", "1.0.3"]
+        if not include_output:
+            index = args.index("--output-dir")
+            del args[index:index + 2]
+        if repo is not None:
+            args += ["--remote-repo", repo]
+        return args
+
+    def test_project_output_defaults_to_configured_repository_osx_directory(self):
+        self.env["HOME"] = str(self.root)
+        self.write_env(extra="SV2_TP_DETACHED_SIGS_DIR='~/sig repo/'\n")
+        self.output = self.root / "sig repo/osx"
+        self.remote_archives()
+        result = self.run_script(self.remote_arguments(include_output=False))
+        self.assertIn(f"Signatures written to {self.output}", result.stdout)
+        self.assertEqual(len(list(self.output.rglob("*sign"))), 4)
+
+    def test_project_repository_path_is_relative_to_explicit_env_file(self):
+        config = self.root / "config files/signing.env"
+        config.parent.mkdir()
+        self.write_env(config, extra="SV2_TP_DETACHED_SIGS_DIR='sig repo'\n")
+        self.output = config.parent / "sig repo/osx"
+        self.remote_archives()
+        self.run_script(["--env-file", str(config),
+                         *self.remote_arguments(include_output=False)])
+        self.assertEqual(len(list(self.output.rglob("*sign"))), 4)
+
+    def test_environment_repository_overrides_file(self):
+        self.write_env(extra="SV2_TP_DETACHED_SIGS_DIR=unused-repo\n")
+        self.env["SV2_TP_DETACHED_SIGS_DIR"] = str(self.root / "environment repo")
+        self.output = self.root / "environment repo/osx"
+        self.remote_archives()
+        self.run_script(self.remote_arguments(include_output=False))
+        self.assertEqual(len(list(self.output.rglob("*sign"))), 4)
+        self.assertFalse((self.root / "unused-repo").exists())
+
+    def test_explicit_output_overrides_project_repository(self):
+        self.write_env(extra="SV2_TP_DETACHED_SIGS_DIR=unused-repo\n")
+        self.remote_archives()
+        self.run_script(self.remote_arguments())
+        self.assertEqual(len(list(self.output.rglob("*sign"))), 4)
+        self.assertFalse((self.root / "unused-repo").exists())
+
+    def test_missing_or_empty_repository_requires_explicit_project_output(self):
+        self.write_env(extra="SV2_TP_DETACHED_SIGS_DIR=unused-repo\n")
+        self.env["SV2_TP_DETACHED_SIGS_DIR"] = ""
+        self.run_script(self.remote_arguments(include_output=False), ok=False)
+        self.assertEqual(self.calls(), [])
+        self.env.pop("SV2_TP_DETACHED_SIGS_DIR")
+        self.write_env()
+        self.run_script(self.remote_arguments(include_output=False), ok=False)
+        self.assertEqual(self.calls(), [])
+
+    def test_project_repository_does_not_default_output_for_explicit_targets(self):
+        self.write_env(extra="SV2_TP_DETACHED_SIGS_DIR=unused-repo\n")
+        args = self.arguments()
+        index = args.index("--output-dir")
+        del args[index:index + 2]
+        self.run_script(args, ok=False)
+        self.assertEqual(self.calls(), [])
+        self.assertFalse((self.root / "unused-repo").exists())
+
+    def remote_archives(self, bad_entry=None, missing_binary=False):
+        # Match contrib/guix/libexec/package.sh: find . archives the extraction
+        # root, a helper script, and the versioned installation directory.
+        archives = self.root / "remote archives"
+        archives.mkdir(exist_ok=True)
+        self.env["REMOTE_ARCHIVES"] = str(archives)
+        self.env["HELPER_MARKER"] = str(self.root / "helper-executed")
+        for host in ("arm64-apple-darwin", "x86_64-apple-darwin"):
+            archive = archives / f"sv2-tp-1.0.3-{host}-codesigning.tar.gz"
+            with tarfile.open(archive, "w:gz") as output:
+                for directory in (".", "./sv2-tp-1.0.3", "./sv2-tp-1.0.3/bin"):
+                    member = tarfile.TarInfo(directory)
+                    member.type = tarfile.DIRTYPE
+                    output.addfile(member)
+                helper = b'#!/bin/sh\nprintf executed > "$HELPER_MARKER"\nexit 99\n'
+                member = tarfile.TarInfo("./detached-sig-create.sh")
+                member.size = len(helper)
+                member.mode = 0o755
+                output.addfile(member, io.BytesIO(helper))
+                for binary in ("sv2-tp", "test_sv2"):
+                    if missing_binary and binary == "test_sv2":
+                        continue
+                    member = tarfile.TarInfo(f"./sv2-tp-1.0.3/bin/{binary}")
+                    member.size = len(b"unsigned")
+                    member.mode = 0o755
+                    output.addfile(member, io.BytesIO(b"unsigned"))
+                if bad_entry:
+                    output.addfile(bad_entry)
+        return archives
+
+    def test_remote_fetches_both_archives_signs_four_targets_and_cleans_up(self):
+        self.remote_archives()
+        self.run_script(self.remote_arguments())
+        copies = [call for call in self.calls() if call[0] == "scp"]
+        self.assertEqual(len(copies), 1)
+        self.assertEqual(copies[0][1],
+                         "builder@guix:sv2-tp/guix-build-1.0.3/output/*-apple-darwin/"
+                         "sv2-tp-1.0.3-*-apple-darwin-codesigning.tar.gz")
+        self.assertEqual(len(self.calls("sign")), 4)
+        self.assertEqual(len(self.calls("notarytool")), 4)
+        self.assertEqual(len(list(self.output.rglob("*sign"))), 4)
+        for call in self.calls("sign"):
+            self.assertFalse(Path(call[6]).exists(), "Fetched inputs were not cleaned up")
+        self.assertFalse(Path(self.env["HELPER_MARKER"]).exists(), "Archive helper was executed")
+
+    def git(self, repo, *args):
+        result = subprocess.run(["git", "-C", str(repo), *args], env=self.env,
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return result.stdout.strip()
+
+    def signatures_repository(self):
+        repo = self.root / "signature repo"
+        repo.mkdir()
+        self.git(repo, "init", "-q")
+        self.git(repo, "config", "user.name", "Signing Test")
+        self.git(repo, "config", "user.email", "test@example.invalid")
+        self.git(repo, "config", "commit.gpgsign", "false")
+        self.git(repo, "config", "core.hooksPath", str(repo / ".git/hooks"))
+        (repo / "README").write_text("existing signatures repository")
+        self.git(repo, "add", "README")
+        self.git(repo, "commit", "-qm", "Initial commit")
+        self.output = repo / "osx"
+        return repo
+
+    def test_signatures_are_committed_without_unrelated_index_or_worktree_changes(self):
+        repo = self.signatures_repository()
+        (repo / "README").write_text("unrelated unstaged edit")
+        (repo / "staged-note").write_text("unrelated staged addition")
+        (repo / "untracked-note").touch()
+        self.git(repo, "add", "staged-note")
+        self.remote_archives()
+        self.run_script(self.remote_arguments())
+        self.assertEqual(self.git(repo, "log", "-1", "--format=%s"),
+                         "Add 1.0.3 detached macOS signatures")
+        expected = sorted(f"osx/{host}/sv2-tp-1.0.3/bin/{binary}.{arch}sign"
+                          for host, arch in (("arm64-apple-darwin", "arm64"),
+                                             ("x86_64-apple-darwin", "x86_64"))
+                          for binary in ("sv2-tp", "test_sv2"))
+        self.assertEqual(self.git(repo, "diff-tree", "--no-commit-id", "--name-only",
+                                  "-r", "HEAD").splitlines(), expected)
+        self.assertEqual(self.git(repo, "diff", "--cached", "--name-only"), "staged-note")
+        self.assertEqual((repo / "README").read_text(), "unrelated unstaged edit")
+        self.assertTrue((repo / "untracked-note").exists())
+        self.assertEqual(self.git(repo, "diff", "--name-only"), "README")
+
+    def test_commit_paths_are_literal_and_explicit_targets_are_supported(self):
+        repo = self.signatures_repository()
+        target = ":(glob)*"
+        (self.inputs / target).write_text("unsigned")
+        self.run_script(self.arguments([target]))
+        self.assertEqual(self.git(repo, "log", "-1", "--format=%s"),
+                         "Add detached macOS signatures")
+        self.assertEqual(self.git(repo, "diff-tree", "--no-commit-id", "--name-only",
+                                  "-r", "HEAD"), "osx/:(glob)*.arm64sign")
+        self.assertEqual(self.git(repo, "status", "--porcelain"), "")
+
+    def test_signing_failure_does_not_commit(self):
+        repo = self.signatures_repository()
+        before = self.git(repo, "rev-parse", "HEAD")
+        self.remote_archives()
+        self.env["FAIL_TARGET"] = "test_sv2"
+        self.run_script(self.remote_arguments(), ok=False)
+        self.assertEqual(self.git(repo, "rev-parse", "HEAD"), before)
+        self.assertEqual(self.git(repo, "status", "--porcelain"), "")
+
+    def test_commit_failure_keeps_published_signatures_for_manual_commit(self):
+        repo = self.signatures_repository()
+        before = self.git(repo, "rev-parse", "HEAD")
+        hook = repo / ".git/hooks/pre-commit"
+        hook.write_text("#!/bin/sh\nexit 1\n")
+        hook.chmod(0o755)
+        self.remote_archives()
+        result = self.run_script(self.remote_arguments(), ok=False, output_unchanged=False)
+        self.assertIn("commit them manually", result.stderr)
+        self.assertEqual(self.git(repo, "rev-parse", "HEAD"), before)
+        self.assertEqual(len(list(self.output.rglob("*sign"))), 4)
+        self.assertEqual(len(self.git(repo, "diff", "--cached", "--name-only").splitlines()), 4)
+
+    def test_remote_missing_architecture_archive_stops_before_signing(self):
+        archives = self.remote_archives()
+        (archives / "sv2-tp-1.0.3-x86_64-apple-darwin-codesigning.tar.gz").unlink()
+        self.run_script(self.remote_arguments(), ok=False)
+        self.assertEqual(self.calls("sign"), [])
+        self.assertEqual(len([call for call in self.calls() if call[0] == "scp"]), 1)
+
+    def test_remote_archive_root_directory_entry_is_allowed(self):
+        for name in (".", "./"):
+            with self.subTest(name=name):
+                member = tarfile.TarInfo(name)
+                member.type = tarfile.DIRTYPE
+                self.remote_archives(bad_entry=member)
+                self.run_script(self.remote_arguments())
+                self.assertEqual(len(list(self.output.rglob("*sign"))), 4)
+                shutil.rmtree(self.output)
+
+    def test_remote_checkout_override(self):
+        self.remote_archives()
+        self.run_script(self.remote_arguments("/srv/build/sv2-tp"))
+        copies = [call for call in self.calls() if call[0] == "scp"]
+        self.assertTrue(all(call[1].startswith("builder@guix:/srv/build/sv2-tp/")
+                            for call in copies))
+
+    def test_remote_fetch_failure_never_signs_or_publishes(self):
+        self.remote_archives()
+        for failure in ("all", "sv2-tp-1.0.3-x86_64-apple-darwin-codesigning.tar.gz"):
+            with self.subTest(failure=failure):
+                self.env["FAIL_FETCH"] = failure
+                self.run_script(self.remote_arguments(), ok=False)
+                self.assertEqual(self.calls("sign"), [])
+
+    def test_remote_notarization_failure_cleans_up_inputs(self):
+        self.remote_archives()
+        self.env["FAIL_TARGET"] = "test_sv2"
+        self.run_script(self.remote_arguments(), ok=False)
+        self.assertEqual(len(self.calls("sign")), 2)
+
+    def test_remote_missing_targets_are_detected_before_signing(self):
+        self.remote_archives(missing_binary=True)
+        self.run_script(self.remote_arguments(), ok=False)
+        self.assertEqual(self.calls("sign"), [])
+
+    def test_remote_unsafe_archives_are_rejected_before_signing(self):
+        entries = [tarfile.TarInfo(name) for name in
+                   (".", "./", "../../escaped", "/tmp/escaped",
+                    "sv2-tp-1.0.3/../../escaped")]
+        for kind in (tarfile.SYMTYPE, tarfile.LNKTYPE, tarfile.FIFOTYPE):
+            for name in ("sv2-tp-1.0.3/link", "./detached-sig-create.sh"):
+                member = tarfile.TarInfo(name)
+                member.type = kind
+                member.linkname = "../../escaped"
+                entries.append(member)
+        for member in entries:
+            with self.subTest(name=member.name, kind=member.type):
+                self.remote_archives(bad_entry=member)
+                result = self.run_script(self.remote_arguments(), ok=False)
+                self.assertIn("Unsafe archive entry", result.stderr)
+                self.assertEqual(self.calls("sign"), [])
+        self.assertFalse((self.root / "escaped").exists())
+
+    def test_remote_corrupt_archive_is_rejected(self):
+        archives = self.remote_archives()
+        for archive in archives.iterdir():
+            archive.write_text("not a gzip archive")
+        self.run_script(self.remote_arguments(), ok=False)
+        self.assertEqual(self.calls("sign"), [])
+
+    def test_invalid_remote_options_fail_before_external_commands(self):
+        for extra in (["--remote", "guix"], ["--remote-repo", "sv2-tp"],
+                      ["--remote", "-bad"], ["--remote", "host;command"]):
+            with self.subTest(extra=extra):
+                self.run_script([*extra, *self.arguments()], ok=False)
+                self.assertEqual(self.calls(), [])
+        for host in ("host;command", "user@host:/path", "host with spaces"):
+            with self.subTest(host=host):
+                args = self.remote_arguments()
+                args[args.index("--remote") + 1] = host
+                self.run_script(args, ok=False)
+                self.assertEqual(self.calls(), [])
+        for repo in ("repo with spaces", "repo;command", "-option", "$(command)"):
+            with self.subTest(repo=repo):
+                self.run_script(self.remote_arguments(repo), ok=False)
+                self.assertEqual(self.calls(), [])
+        args = self.arguments()
+        index = args.index("--input-dir")
+        args[index:index + 2] = ["--remote", "guix"]
+        self.run_script(args, ok=False)
+        self.assertEqual(self.calls(), [])
 
     def test_invalid_project_options_fail_before_signing(self):
         base = self.arguments([])[:-1]

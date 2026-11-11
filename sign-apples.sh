@@ -6,7 +6,7 @@ set -euo pipefail
 usage() {
     cat <<'HELP'
 Usage: sign-apples.sh [OPTIONS] --input-dir DIR --output-dir DIR [--] TARGET...
-  or: sign-apples.sh [OPTIONS] --input-dir DIR --output-dir DIR --project sv2-tp --release VERSION
+  or: sign-apples.sh [OPTIONS] (--input-dir DIR | --remote HOST) [--output-dir DIR] --project sv2-tp --release VERSION
 
 Create detached macOS signatures, apply them, and notarize each target.
 TARGETs are paths relative to --input-dir: Mach-O binaries or .app bundles.
@@ -23,6 +23,8 @@ Options:
   --key-id ID         App Store Connect API key ID
   --issuer UUID       App Store Connect issuer ID
   --input-dir DIR     Root containing already extracted, unsigned targets
+  --remote HOST       Fetch Guix codesigning archives over SCP (project mode)
+  --remote-repo DIR   Remote checkout (default: project name, relative to home)
   --output-dir DIR    Signatures directory; may already contain other releases
   --project NAME      Select supported project targets (currently: sv2-tp)
   --release VERSION   Release directory version; required with --project
@@ -37,17 +39,28 @@ Environment:
   SIGNAPPLE_PASSPHRASE         Signing key passphrase; prompt once if unset
   SIGNAPPLE_NOTARY_PASSPHRASE  API key passphrase; defaults to signing passphrase
                              Set explicitly to empty for an unencrypted API key
+  SV2_TP_DETACHED_SIGS_DIR     Repository root; defaults sv2-tp output to its osx/
+                             directory when --output-dir is omitted
 
 These variables can also be set in .env (see .env.example). Precedence:
 command-line options, then environment, then file. File values are literal,
-optionally quoted, without shell expansion. Credential paths in the file may
+optionally quoted, without shell expansion. Paths in the file may
 start with ~/; relative paths in the file resolve against its directory.
 
-Requires Bash 3.2+, signapple, Python 3, and xcrun notarytool (macOS).
+Remote mode replaces --input-dir and requires --project and --release.
+It fetches <repo>/guix-build-<release>/output/<host>/
+<project>-<release>-<host>-codesigning.tar.gz for both Apple hosts.
+Archives and extracted inputs are temporary and removed on exit.
+Use an SSH alias or [user@]hostname; configure ports in ~/.ssh/config.
+
+Requires Bash 3.2+, Git, signapple, Python 3, and xcrun notarytool (macOS).
 Every notarization must have a top-level JSON status of Accepted.
 Output is added only after all targets succeed. Existing files are never
 overwritten; a conflicting path fails publication. Inputs may already be modified.
-Use fresh extracted inputs when retrying. No downloads or Git operations run.
+Use fresh extracted inputs when retrying local mode. When output is in a Git
+worktree, only this run's signatures are committed; other changes are preserved.
+Plain output directories are supported. No push runs. If committing fails,
+signatures remain in the output directory for a manual commit.
 HELP
 }
 
@@ -61,6 +74,8 @@ api_key=""
 key_id=""
 issuer=""
 input_dir=""
+remote=""
+remote_repo=""
 output_dir=""
 env_file=".env"
 explicit_env_file=false
@@ -70,7 +85,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         -h|--help) usage; exit 0 ;;
         --version) echo 'sign-apples.sh 1.0'; exit 0 ;;
-        --certificate|--api-key|--key-id|--issuer|--input-dir|--output-dir|--env-file|--project|--release)
+        --certificate|--api-key|--key-id|--issuer|--input-dir|--output-dir|--env-file|--project|--release|--remote|--remote-repo)
             [[ $# -ge 2 && -n "$2" && "$2" != -* ]] || die "Missing value for $1"
             case "$1" in
                 --certificate) certificate="$2" ;;
@@ -78,6 +93,8 @@ while [[ $# -gt 0 ]]; do
                 --key-id) key_id="$2" ;;
                 --issuer) issuer="$2" ;;
                 --input-dir) input_dir="$2" ;;
+                --remote) remote="$2" ;;
+                --remote-repo) remote_repo="$2" ;;
                 --output-dir) output_dir="$2" ;;
                 --env-file) env_file="$2"; explicit_env_file=true ;;
                 --project) project="$2" ;;
@@ -99,15 +116,16 @@ if [[ "$explicit_env_file" == true || -e "$env_file" || -L "$env_file" ]]; then
 import pathlib, re, shlex, sys
 
 allowed = {"SIGNAPPLE_CERTIFICATE", "SIGNAPPLE_API_KEY", "SIGNAPPLE_KEY_ID",
-           "SIGNAPPLE_ISSUER", "SIGNAPPLE_PASSPHRASE", "SIGNAPPLE_NOTARY_PASSPHRASE"}
-paths = {"SIGNAPPLE_CERTIFICATE", "SIGNAPPLE_API_KEY"}
+           "SIGNAPPLE_ISSUER", "SIGNAPPLE_PASSPHRASE", "SIGNAPPLE_NOTARY_PASSPHRASE",
+           "SV2_TP_DETACHED_SIGS_DIR"}
+paths = {"SIGNAPPLE_CERTIFICATE", "SIGNAPPLE_API_KEY", "SV2_TP_DETACHED_SIGS_DIR"}
 source = pathlib.Path(sys.argv[1]).resolve()
 seen = set()
 try:
     for number, line in enumerate(source.read_text().splitlines(), 1):
         if not line.strip() or line.lstrip().startswith("#"):
             continue
-        match = re.fullmatch(r"\s*(?:export\s+)?([A-Z_]+)\s*=\s*(.*)", line)
+        match = re.fullmatch(r"\s*(?:export\s+)?([A-Z_][A-Z0-9_]*)\s*=\s*(.*)", line)
         if not match or match[1] not in allowed:
             raise ValueError(f"unsupported setting on line {number}")
         if match[1] in seen:
@@ -147,6 +165,9 @@ if [[ -n "$project" ]]; then
     [[ "$release" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]] || die "--project requires a valid --release version"
     case "$project" in
         sv2-tp)
+            if [[ -z "$output_dir" && -n "${SV2_TP_DETACHED_SIGS_DIR:-}" ]]; then
+                output_dir="${SV2_TP_DETACHED_SIGS_DIR%/}/osx"
+            fi
             set -- "arm64-apple-darwin/sv2-tp-$release/bin/sv2-tp" \
                 "arm64-apple-darwin/sv2-tp-$release/bin/test_sv2" \
                 "x86_64-apple-darwin/sv2-tp-$release/bin/sv2-tp" \
@@ -156,26 +177,88 @@ if [[ -n "$project" ]]; then
 elif [[ -n "$release" ]]; then
     die "--release requires --project"
 fi
+if [[ -n "$remote" ]]; then
+    [[ -z "$input_dir" ]] || die "Do not combine --remote with --input-dir"
+    [[ -n "$project" ]] || die "--remote requires --project and --release"
+    [[ "$remote" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.@-]*$ ]] || die "Use an SSH alias or [user@]hostname"
+    remote_repo="${remote_repo:-$project}"
+    # Safe for both SFTP scp and legacy scp's remote shell.
+    [[ "$remote_repo" =~ ^[a-zA-Z0-9_./-]+$ && "$remote_repo" != -* ]] || die "Remote path must use only letters, digits, underscores, dots, slashes or hyphens"
+elif [[ -n "$remote_repo" ]]; then
+    die "--remote-repo requires --remote"
+fi
 [[ -n "$certificate" && -n "$api_key" && -n "$key_id" && -n "$issuer" &&
-   -n "$input_dir" && -n "$output_dir" && $# -gt 0 ]] || {
+   ( -n "$input_dir" || -n "$remote" ) && -n "$output_dir" && $# -gt 0 ]] || {
     usage >&2
-    die "Credentials, input/output directories, and at least one target are required"
+    die "Credentials, an input directory or remote, output directory, and at least one target are required"
 }
 [[ "$key_id" =~ ^[a-zA-Z0-9]+$ ]] || die "API key ID must contain only letters and digits"
 
 # Absolute paths keep leading dashes and spaces safe in external commands.
 for name in certificate api_key input_dir output_dir; do
     value="${!name}"
-    [[ "$value" == /* ]] || printf -v "$name" '%s/%s' "$PWD" "$value"
+    [[ -z "$value" || "$value" == /* ]] || printf -v "$name" '%s/%s' "$PWD" "$value"
 done
 [[ -f "$certificate" && -r "$certificate" ]] || die "Unreadable certificate: $certificate"
 [[ -f "$api_key" && -r "$api_key" ]] || die "Unreadable API key: $api_key"
 [[ "$(basename "$api_key")" == *AuthKey_"$key_id".p8 ]] || die "API key filename must end in AuthKey_${key_id}.p8 (signapple derives its key ID from this name)"
-[[ -d "$input_dir" ]] || die "Input directory does not exist: $input_dir"
-input_dir=$(cd "$input_dir" && pwd -P)
 # Strip trailing slashes so even a dangling output symlink is refused.
 while [[ "$output_dir" == */ ]]; do output_dir="${output_dir%/}"; done
 [[ -n "$output_dir" && ! -L "$output_dir" && ( ! -e "$output_dir" || -d "$output_dir" ) ]] || die "Output must be a directory, not a file or symlink: $output_dir"
+
+trap 'unset SIGNAPPLE_PASSPHRASE SIGNAPPLE_NOTARY_PASSPHRASE; if [[ -n "${work_dir:-}" ]]; then rm -rf -- "$work_dir"; fi; if [[ -n "${fetch_dir:-}" ]]; then rm -rf -- "$fetch_dir"; fi' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+if [[ -n "$remote" ]]; then
+    for command in scp python3 mktemp; do
+        command -v "$command" >/dev/null || die "Required command not found: $command"
+    done
+    fetch_dir=$(mktemp -d "${TMPDIR:-/tmp}/.sign-apples.fetch.XXXXXXXX")
+    input_dir="$fetch_dir/inputs"
+    mkdir "$input_dir"
+    # One remote glob source keeps both downloads on one SSH connection. Passing
+    # two remote source arguments can make scp open separate connections.
+    echo "Fetching Apple codesigning archives from $remote"
+    scp "$remote:$remote_repo/guix-build-$release/output/*-apple-darwin/$project-$release-*-apple-darwin-codesigning.tar.gz" \
+        "$fetch_dir/" || die "Could not fetch Guix codesigning archives"
+    for host in arm64-apple-darwin x86_64-apple-darwin; do
+        archive="$project-$release-$host-codesigning.tar.gz"
+        mkdir "$input_dir/$host"
+        # Guix archives include helper scripts beside the release directory.
+        # Extract regular files/directories without executing helpers or allowing
+        # archive paths or links to write outside the private input root.
+        python3 - "$fetch_dir/$archive" "$input_dir/$host" <<'PYREMOTE'
+import pathlib, shutil, sys, tarfile
+
+archive, root = sys.argv[1:]
+try:
+    with tarfile.open(archive, "r:gz") as source:
+        members = source.getmembers()
+        for member in members:
+            # tar -C <directory> . includes a harmless extraction-root entry.
+            if member.isdir() and member.name in (".", "./"):
+                continue
+            path = pathlib.PurePosixPath(member.name)
+            if (path.is_absolute() or ".." in path.parts or not path.parts
+                    or not (member.isdir() or member.isfile())):
+                raise ValueError(f"Unsafe archive entry: {member.name}")
+        for member in members:
+            destination = pathlib.Path(root) / member.name
+            if member.isdir():
+                destination.mkdir(parents=True, exist_ok=True)
+            else:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                with source.extractfile(member) as incoming, destination.open("xb") as outgoing:
+                    shutil.copyfileobj(incoming, outgoing)
+                destination.chmod(member.mode & 0o777)
+except (OSError, ValueError, tarfile.TarError) as error:
+    sys.exit(f"Error: Could not extract {archive}: {error}")
+PYREMOTE
+    done
+fi
+[[ -d "$input_dir" ]] || die "Input directory does not exist: $input_dir"
+input_dir=$(cd "$input_dir" && pwd -P)
 
 targets=("$@")
 checked=()
@@ -202,15 +285,12 @@ for target in "${targets[@]}"; do
     checked+=("$target")
 done
 
-for command in signapple xcrun python3 mktemp tee sed tail; do
+for command in git signapple xcrun python3 mktemp tee sed tail; do
     command -v "$command" >/dev/null || die "Required command not found: $command"
 done
 signapple --help >/dev/null
 xcrun --find notarytool >/dev/null
 
-trap 'unset SIGNAPPLE_PASSPHRASE SIGNAPPLE_NOTARY_PASSPHRASE; if [[ -n "${work_dir:-}" ]]; then rm -rf -- "$work_dir"; fi' EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
 if [[ ! ${SIGNAPPLE_PASSPHRASE+x} ]]; then
     [[ -t 0 ]] || die "Set SIGNAPPLE_PASSPHRASE when standard input is not a terminal"
     IFS= read -r -s -p 'Enter signing key passphrase: ' SIGNAPPLE_PASSPHRASE || die "Could not read passphrase"
@@ -327,3 +407,27 @@ except (OSError, ValueError, KeyboardInterrupt) as error:
     sys.exit(f"Error: Could not publish signatures: {error}")
 PY
 echo "Signatures written to $output_dir"
+
+# Use exact staged output paths, rather than adding the output tree, so unrelated
+# working-tree and index changes are preserved. A Git failure leaves the signed
+# artifacts available for a manual commit without repeating notarization.
+python3 - "$work_dir/signatures" "$output_dir" "$release" <<'PY'
+import pathlib, subprocess, sys
+
+source, output = map(pathlib.Path, sys.argv[1:3])
+release = sys.argv[3]
+git = ["git", "--literal-pathspecs", "-C", str(output)]
+inside = subprocess.run([*git, "rev-parse", "--is-inside-work-tree"],
+                        capture_output=True, text=True)
+if inside.returncode or inside.stdout.strip() != "true":
+    print("Output is outside a Git worktree; signatures were not committed")
+    sys.exit(0)
+files = sorted(str(path.relative_to(source)) for path in source.rglob("*") if path.is_file())
+message = f"Add {release} detached macOS signatures" if release else "Add detached macOS signatures"
+try:
+    subprocess.run([*git, "add", "--", *files], check=True)
+    subprocess.run([*git, "commit", "--only", "-m", message, "--", *files], check=True)
+except (OSError, subprocess.CalledProcessError) as error:
+    sys.exit(f"Error: Could not commit signatures: {error}. "
+             f"Signatures remain in {output}; commit them manually.")
+PY
